@@ -1158,6 +1158,27 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # Model recommendation layer — heuristic complexity assessment that
+        # suggests switching to a more or less capable model based on task
+        # complexity.  Disabled by default (opt-in).
+        "model_recommendation": {
+            "enabled": False,
+            "interactive": True,
+            "min_turns_between_prompts": 5,
+            "heavy_token_threshold": 30000,
+            "lightweight_token_threshold": 2000,
+            "media_detection": True,
+        },
+        # Intelligent model router — 3-tier auto-selection engine that
+        # detects context pressure, file count, and reasoning depth to
+        # route requests to the most appropriate model.  Disabled by
+        # default (opt-in).  When enabled, supersedes model_recommendation.
+        "model_router": {
+            "enabled": False,
+            "auto_switch": False,
+            "context_pressure_threshold": 0.70,
+            "large_file_count_threshold": 100,
+        },
     },
     
     "terminal": {

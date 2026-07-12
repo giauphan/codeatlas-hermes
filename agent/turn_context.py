@@ -34,6 +34,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.model_router import RouterConfig
 
 logger = logging.getLogger(__name__)
 
@@ -527,6 +528,50 @@ def build_turn_context(
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
+
+    # ── Intelligent Model Router ─────────────────────────────────────
+    # 3-tier router: auto-detects context pressure, file count, and
+    # reasoning depth to recommend or auto-switch the model.
+    try:
+        router_cfg = RouterConfig.from_config(agent.__dict__.get("config", {}))
+        if router_cfg.enabled:
+            est_tokens = 0
+            try:
+                est_tokens = estimate_request_tokens_rough(messages or [])
+            except Exception:
+                pass
+            from agent.model_router import _detect_file_count_pressure, route, build_route_note
+            est_files = _detect_file_count_pressure(messages or [])
+
+            is_deep = False
+            msg_lower = (original_user_message or "").lower()
+            for kw in ("debug", "diagnose", "troubleshoot", "root cause",
+                       "security", "investigate", "complex algorithm"):
+                if kw in msg_lower:
+                    is_deep = True
+                    break
+
+            decision = route(
+                current_model=getattr(agent, "model", "") or "",
+                estimated_tokens=est_tokens,
+                estimated_files=est_files,
+                is_deep_reasoning_task=is_deep,
+                cfg=router_cfg,
+            )
+            if decision.should_switch:
+                _note = build_route_note(decision)
+                if _note:
+                    if plugin_user_context:
+                        plugin_user_context += "\n\n" + _note
+                    else:
+                        plugin_user_context = _note
+                    logger.info(
+                        "Model router: tier=%s → %s (switch=%s reason=%s)",
+                        decision.tier, decision.recommended_model,
+                        decision.should_switch, decision.reason,
+                    )
+    except Exception as exc:
+        logger.debug("Model router check failed: %s", exc)
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}

@@ -319,9 +319,6 @@ def route(
     # Get current model info
     current_tier = _model_to_tier(current_model)
 
-    # Determine if we need to switch
-    should_switch = current_tier != tier
-
     # Pick the best model for this tier (round-robin)
     candidates = _TIER_MODELS.get(tier, [])
     if not candidates:
@@ -337,8 +334,14 @@ def route(
         rr = get_rr_tracker(session_id)
         best_model, reasoning_mode = rr.next(tier, candidates)
     else:
-        # No session — still rotate per call (stateless fallback)
+        # No session — pick first model
         best_model, reasoning_mode = candidates[0]
+
+    # Determine if we need to switch
+    # Trigger on:
+    #   1. Tier change (e.g. Default → Large Context)
+    #   2. Round-robin picks a different model within the same tier
+    should_switch = (current_tier != tier) or (best_model != current_model)
 
     # Build reason
     reasons = []

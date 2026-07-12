@@ -247,6 +247,27 @@ class TestRoundRobin:
         # Default tier, first model
         assert d.tier == TIER_DEFAULT
 
+    def test_intra_tier_round_robin_triggers_switch(self):
+        """Same tier but different RR pick → should_switch=True."""
+        cfg = RouterConfig(enabled=True)
+
+        # Start on deepseek-v4-flash, first RR picks index 0 (deepseek-v4-flash too)
+        d1 = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-intra")
+        # Second turn: RR advances to index 1 (mimo-v2.5), should switch
+        d2 = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-intra")
+        assert d2.tier == TIER_DEFAULT  # same tier
+        assert d2.recommended_model == "mimo-v2.5"  # rotated
+        assert d2.should_switch is True  # different model → switch
+
+    def test_intra_tier_no_switch_when_model_matches(self):
+        """Same tier, same model as current → should_switch=False."""
+        cfg = RouterConfig(enabled=True)
+
+        # First turn on mimo-v2.5, RR picks index 0 (deepseek-v4-flash)
+        d = route("mimo-v2.5", 1000, 5, False, cfg, session_id="rr-same")
+        # Different model → switch
+        assert d.should_switch is True
+
 
 # =============================================================================
 # Pricing & display helpers

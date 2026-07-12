@@ -557,6 +557,7 @@ def build_turn_context(
                 estimated_files=est_files,
                 is_deep_reasoning_task=is_deep,
                 cfg=router_cfg,
+                session_id=agent.session_id or "",
             )
             if decision.should_switch:
                 _note = build_route_note(decision)

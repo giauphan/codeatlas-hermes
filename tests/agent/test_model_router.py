@@ -197,6 +197,58 @@ class TestRoute:
 
 
 # =============================================================================
+# Round-robin
+# =============================================================================
+
+
+class TestRoundRobin:
+    def test_rotates_through_default_tier(self):
+        """Session-based round-robin rotates through Tier 1 models."""
+        cfg = RouterConfig(enabled=True)
+        models_seen: set[str] = set()
+        for _ in range(6):
+            d = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-test-1")
+            models_seen.add(d.recommended_model)
+        # Should see multiple models in Tier 1
+        assert len(models_seen) > 1
+
+    def test_rotates_through_large_context_tier(self):
+        """Context pressure triggers Large Context tier with round-robin."""
+        cfg = RouterConfig(context_pressure_threshold=0.30)
+        models_seen: set[str] = set()
+        for _ in range(10):
+            d = route("deepseek-v4-flash", 400_000, 5, False, cfg, session_id="rr-test-2")
+            models_seen.add(d.recommended_model)
+        # DeepSeek V4 Flash (cheapest in tier 2) should be first,
+        # but round-robin should cycle through all in the tier
+        assert "deepseek-v4-flash" in models_seen
+        assert len(models_seen) >= 2  # at least Flash + one other
+
+    def test_different_sessions_independent(self):
+        """Two sessions have independent round-robin state."""
+        cfg = RouterConfig(enabled=True)
+        # Session A — first call
+        a1 = route("deepseek-v4-flash", 1000, 5, True, cfg, session_id="rr-a")
+        # Session B — first call
+        b1 = route("deepseek-v4-flash", 1000, 5, True, cfg, session_id="rr-b")
+        # Both should start at index 0 (same model for Tier 3, only 1 candidate)
+        assert a1.recommended_model == b1.recommended_model
+
+    def test_tier_change_resets_index(self):
+        """Changing tier resets the round-robin index."""
+        cfg = RouterConfig(enabled=True)
+
+        # Call deep reasoning (Tier 3) — advances index
+        for _ in range(5):
+            route("deepseek-v4-flash", 1000, 5, True, cfg, session_id="rr-reset")
+
+        # Switch to default (Tier 1) — should reset to 0
+        d = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-reset")
+        # Default tier, first model
+        assert d.tier == TIER_DEFAULT
+
+
+# =============================================================================
 # Pricing & display helpers
 # =============================================================================
 

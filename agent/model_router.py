@@ -12,10 +12,11 @@ Tier 1 — Default (cheapest: $0.14/M)
     Chat, small code edits, syntax fixes, documentation, minor refactoring.
     Models: ``deepseek-v4-flash``, ``mimo-v2.5``
 
-Tier 2 — Large Context ($1.40–$1.74/M, 1M+ context)
+Tier 2 — Large Context (1M context, Flash preferred)
     Large repositories, multi-file changes, architecture analysis,
     repository-wide understanding, feature extension.
-    Models: ``deepseek-v4-pro``, ``mimo-v2.5-pro``, ``glm-5.2``
+    Tries ``deepseek-v4-flash`` first (1M context, $0.14/M).
+    Falls back to ``deepseek-v4-pro`` / ``glm-5.2`` / ``mimo-v2.5-pro``.
 
 Tier 3 — Deep Reasoning ($1.74/M, max reasoning)
     Difficult debugging, root cause analysis, security investigation,
@@ -67,6 +68,7 @@ _TIER_MODELS: dict[str, list[tuple[str, bool]]] = {
         ("mimo-v2.5", False),
     ],
     TIER_LARGE_CONTEXT: [
+        ("deepseek-v4-flash", False),  # 1M context, try cheap first
         ("glm-5.2", False),
         ("deepseek-v4-pro", False),
         ("mimo-v2.5-pro", False),
@@ -235,7 +237,62 @@ def classify_routing_tier(
     return TIER_DEFAULT
 
 
-# ── Route decision ───────────────────────────────────────────────────────────
+# ── Round-robin state per session ────────────────────────────────────────────
+
+
+class RoundRobinTracker:
+    """Rotates through models in each tier to distribute load.
+
+    Maintains a per-tier index that advances every time a tier is
+    selected.  The index resets when the tier changes.
+    """
+
+    def __init__(self):
+        self._indices: dict[str, int] = {}
+        self._last_tier: str | None = None
+
+    def next(self, tier: str, candidates: list[tuple[str, bool]]) -> tuple[str, bool]:
+        """Get the next model in round-robin order for this tier.
+
+        Resets to 0 when the tier changes from the previous call.
+        """
+        # Reset index on tier change
+        if self._last_tier is not None and self._last_tier != tier:
+            self._indices.pop(tier, None)
+        self._last_tier = tier
+
+        if not candidates:
+            return ("", False)
+
+        idx = self._indices.get(tier, 0)
+        if idx >= len(candidates):
+            idx = 0
+
+        chosen = candidates[idx]
+
+        # Advance for next turn
+        self._indices[tier] = (idx + 1) % len(candidates)
+
+        return chosen
+
+
+# Global round-robin state (one per session; turn_context creates per-session)
+SESSION_RR: dict[str, RoundRobinTracker] = {}
+
+
+def get_rr_tracker(session_id: str) -> RoundRobinTracker:
+    """Get or create a round-robin tracker for a session."""
+    if session_id not in SESSION_RR:
+        SESSION_RR[session_id] = RoundRobinTracker()
+    return SESSION_RR[session_id]
+
+
+def reset_rr(session_id: str) -> None:
+    """Reset round-robin state for a session."""
+    SESSION_RR.pop(session_id, None)
+
+
+# ── Main routing ─────────────────────────────────────────────────────────────
 
 
 def route(
@@ -244,8 +301,12 @@ def route(
     estimated_files: int,
     is_deep_reasoning_task: bool,
     cfg: RouterConfig,
+    session_id: str = "",
 ) -> RouteDecision:
     """Main entry point: determine the best model for this request.
+
+    Uses round-robin selection when multiple models in a tier share
+    the same price tier, spreading requests across them.
 
     Returns a RouteDecision indicating which model to use and whether
     to auto-switch.
@@ -258,10 +319,7 @@ def route(
     # Get current model info
     current_tier = _model_to_tier(current_model)
 
-    # Determine if we need to switch
-    should_switch = current_tier != tier
-
-    # Pick the best model for this tier
+    # Pick the best model for this tier (round-robin)
     candidates = _TIER_MODELS.get(tier, [])
     if not candidates:
         return RouteDecision(
@@ -271,12 +329,19 @@ def route(
             reason="No models available for this tier",
         )
 
-    # Find cheapest model in tier that's different from current
-    best_model, reasoning_mode = candidates[0]
-    for mid, rm in candidates:
-        if mid != current_model or current_tier != tier:
-            best_model, reasoning_mode = mid, rm
-            break
+    # Round-robin selection
+    if session_id:
+        rr = get_rr_tracker(session_id)
+        best_model, reasoning_mode = rr.next(tier, candidates)
+    else:
+        # No session — pick first model
+        best_model, reasoning_mode = candidates[0]
+
+    # Determine if we need to switch
+    # Trigger on:
+    #   1. Tier change (e.g. Default → Large Context)
+    #   2. Round-robin picks a different model within the same tier
+    should_switch = (current_tier != tier) or (best_model != current_model)
 
     # Build reason
     reasons = []

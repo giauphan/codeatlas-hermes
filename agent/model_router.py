@@ -12,10 +12,11 @@ Tier 1 — Default (cheapest: $0.14/M)
     Chat, small code edits, syntax fixes, documentation, minor refactoring.
     Models: ``deepseek-v4-flash``, ``mimo-v2.5``
 
-Tier 2 — Large Context ($1.40–$1.74/M, 1M+ context)
+Tier 2 — Large Context (1M context, Flash preferred)
     Large repositories, multi-file changes, architecture analysis,
     repository-wide understanding, feature extension.
-    Models: ``deepseek-v4-pro``, ``mimo-v2.5-pro``, ``glm-5.2``
+    Tries ``deepseek-v4-flash`` first (1M context, $0.14/M).
+    Falls back to ``deepseek-v4-pro`` / ``glm-5.2`` / ``mimo-v2.5-pro``.
 
 Tier 3 — Deep Reasoning ($1.74/M, max reasoning)
     Difficult debugging, root cause analysis, security investigation,
@@ -67,6 +68,7 @@ _TIER_MODELS: dict[str, list[tuple[str, bool]]] = {
         ("mimo-v2.5", False),
     ],
     TIER_LARGE_CONTEXT: [
+        ("deepseek-v4-flash", False),  # 1M context, try cheap first
         ("glm-5.2", False),
         ("deepseek-v4-pro", False),
         ("mimo-v2.5-pro", False),

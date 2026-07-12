@@ -50,8 +50,8 @@ class EscalationLevel:
 
 ESCALATION: list[EscalationLevel] = [
     EscalationLevel("DeepSeek V4 Flash Medium", "deepseek-v4-flash", "medium", 0.14, 0),
-    EscalationLevel("DeepSeek V4 Flash High",   "deepseek-v4-flash", "high",   0.14, 1),
-    EscalationLevel("DeepSeek V4 Pro High",     "deepseek-v4-pro",   "high",   1.74, 2),
+    EscalationLevel("DeepSeek V4 Flash Max",    "deepseek-v4-flash", "max",    0.14, 1),
+    EscalationLevel("DeepSeek V4 Pro Medium",   "deepseek-v4-pro",   "medium", 1.74, 2),
     EscalationLevel("DeepSeek V4 Pro Max",      "deepseek-v4-pro",   "max",    1.74, 3),
 ]
 
@@ -213,11 +213,11 @@ def _target_level(
     if deep_reasoning and pressure >= cfg.context_pressure_threshold:
         return max(current_level, 3)  # Pro Max
     if deep_reasoning:
-        return max(current_level, 2)  # Pro High
-    if refactoring and (estimated_files >= 10 or estimated_tokens >= 100_000):
-        return max(current_level, 2)  # Complex refactor → Pro High
+        return max(current_level, 2)  # Pro Medium
+    if refactoring and (estimated_files >= 6 or estimated_tokens >= 150_000):
+        return max(current_level, 2)  # Complex refactor → Pro Medium
     if refactoring and (estimated_files >= 3 or estimated_tokens >= 30_000):
-        return max(current_level, 1)  # Medium refactor → Flash High
+        return max(current_level, 1)  # Medium refactor → Flash Max
     if pressure >= cfg.context_pressure_threshold or estimated_files >= cfg.large_file_count_threshold:
         return max(current_level, 1)  # Flash High
     if estimated_files >= 50:

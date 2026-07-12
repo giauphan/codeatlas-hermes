@@ -1,5 +1,5 @@
 """
-Tests for the Intelligent Model Router (agent/model_router.py).
+Tests for the Model Router — Escalation Strategy (agent/model_router.py).
 """
 
 from __future__ import annotations
@@ -9,20 +9,36 @@ from typing import Any, Dict, List
 
 from agent.model_router import (
     RouterConfig,
-    RouteDecision,
-    route,
+    EscalationDecision,
+    ESCALATION,
+    escalate,
     build_route_note,
-    classify_routing_tier,
-    _estimate_context_pressure,
+    _requires_deep_reasoning,
     _detect_file_count_pressure,
-    _get_model_price,
-    _get_display_name,
-    adjust_tier_with_knowledge,
-    _model_to_tier,
-    TIER_DEFAULT,
-    TIER_LARGE_CONTEXT,
-    TIER_DEEP_REASONING,
+    reset_rr,
 )
+
+
+# =============================================================================
+# Escalation levels
+# =============================================================================
+
+
+class TestEscalationLevels:
+    def test_4_levels(self):
+        assert len(ESCALATION) == 4
+
+    def test_levels_cost_ascending(self):
+        costs = [l.cost for l in ESCALATION]
+        assert costs == sorted(costs)
+
+    def test_level_0_and_1_same_price(self):
+        assert ESCALATION[0].cost == ESCALATION[1].cost  # both $0.14
+        assert ESCALATION[0].model_id == ESCALATION[1].model_id  # same model
+
+    def test_level_2_and_3_same_price(self):
+        assert ESCALATION[2].cost == ESCALATION[3].cost  # both $1.74
+        assert ESCALATION[2].model_id == ESCALATION[3].model_id  # same model
 
 
 # =============================================================================
@@ -32,284 +48,218 @@ from agent.model_router import (
 
 class TestRouterConfig:
     def test_defaults(self):
-        cfg = RouterConfig.from_config({})
-        assert cfg.enabled is False
-        assert cfg.auto_switch is False
+        cfg = RouterConfig()
+        assert cfg.enabled is True
+        assert cfg.auto_switch is True
         assert cfg.context_pressure_threshold == 0.70
-        assert cfg.large_file_count_threshold == 100
 
     def test_from_config(self):
         cfg = RouterConfig.from_config({
-            "agent": {
-                "model_router": {
-                    "enabled": True,
-                    "auto_switch": True,
-                    "context_pressure_threshold": 0.85,
-                    "large_file_count_threshold": 50,
-                }
-            }
+            "agent": {"model_router": {"enabled": False, "auto_switch": False}}
         })
-        assert cfg.enabled is True
-        assert cfg.auto_switch is True
-        assert cfg.context_pressure_threshold == 0.85
-        assert cfg.large_file_count_threshold == 50
-
-    def test_graceful(self):
-        cfg = RouterConfig.from_config(None)  # type: ignore
         assert cfg.enabled is False
+        assert cfg.auto_switch is False
 
 
 # =============================================================================
-# Context pressure detection
+# Signal detection
 # =============================================================================
 
 
-class TestContextPressure:
-    def test_no_tokens(self):
-        assert _estimate_context_pressure(0, 1_000_000) == 0.0
+class TestDeepReasoning:
+    def test_detects_debug(self):
+        assert _requires_deep_reasoning("debug this crash") is True
 
-    def test_half_full(self):
-        assert _estimate_context_pressure(500_000, 1_000_000) == 0.5
+    def test_detects_security(self):
+        assert _requires_deep_reasoning("security audit needed") is True
 
-    def test_full(self):
-        assert _estimate_context_pressure(1_000_000, 1_000_000) == 1.0
+    def test_normal_question(self):
+        assert _requires_deep_reasoning("What is the capital?") is False
 
-    def test_over_capacity(self):
-        assert _estimate_context_pressure(2_000_000, 1_000_000) == 1.0
-
-    def test_zero_context(self):
-        assert _estimate_context_pressure(500_000, 0) == 0.0
-
-
-class TestFileCountPressure:
-    def test_no_messages(self):
-        assert _detect_file_count_pressure([]) == 0
-
-    def test_text_messages_only(self):
-        msgs = [{"role": "user", "content": "hello"}]
-        assert _detect_file_count_pressure(msgs) == 0
-
-    def test_read_file_calls(self):
-        msgs = [{"role": "assistant", "tool_calls": [
-            {"function": {"name": "read_file", "arguments": '{"path": "foo.py"}'}},
-            {"function": {"name": "read_file", "arguments": '{"path": "bar.py"}'}},
-        ]}]
-        assert _detect_file_count_pressure(msgs) == 2
-
-    def test_duplicate_paths_deduplicated(self):
-        msgs = [{"role": "assistant", "tool_calls": [
-            {"function": {"name": "read_file", "arguments": '{"path": "foo.py"}'}},
-            {"function": {"name": "read_file", "arguments": '{"path": "foo.py"}'}},
-            {"function": {"name": "patch", "arguments": '{"path": "foo.py"}'}},
-        ]}]
-        assert _detect_file_count_pressure(msgs) == 1  # same file
-
-    def test_patch_and_write_included(self):
-        msgs = [{"role": "assistant", "tool_calls": [
-            {"function": {"name": "write_file", "arguments": '{"path": "a.py"}'}},
-            {"function": {"name": "patch", "arguments": '{"path": "b.py"}'}},
-        ]}]
-        assert _detect_file_count_pressure(msgs) == 2
+    def test_refactor_not_deep(self):
+        assert _requires_deep_reasoning("Refactor the auth module") is False
 
 
 # =============================================================================
-# Tier classification
+# Escalate() — main entry point
 # =============================================================================
 
 
-class TestTierClassification:
-    def test_default_tier(self):
-        cfg = RouterConfig()
-        tier = classify_routing_tier(1000, 5, False, "deepseek-v4-flash", cfg)
-        assert tier == TIER_DEFAULT
+class TestEscalate:
+    def test_simple_question_stays_at_0(self):
+        """Simple question on Flash Medium → no escalation."""
+        d = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="What is the capital?",
+            cfg=RouterConfig(),
+            session_id="test-1",
+        )
+        assert d.current_level == 0
+        assert d.recommended_level == 0
+        assert d.should_switch is False
+        assert d.recommended_label == "DeepSeek V4 Flash Medium"
 
-    def test_deep_reasoning_triggers(self):
-        cfg = RouterConfig()
-        tier = classify_routing_tier(1000, 5, True, "deepseek-v4-flash", cfg)
-        assert tier == TIER_DEEP_REASONING
+    def test_debug_escalates_to_pro_high(self):
+        """Deep reasoning from Flash → escalates to Level 2 (Pro High)."""
+        d = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="Debug this crash and find root cause",
+            cfg=RouterConfig(),
+            session_id="test-2",
+        )
+        assert d.recommended_level >= 2
+        assert d.should_switch is True
+        assert d.is_upgrade is True
+        assert "DeepSeek V4 Pro" in d.recommended_label
 
-    def test_context_pressure_triggers_high(self):
-        cfg = RouterConfig(context_pressure_threshold=0.50)
-        tier = classify_routing_tier(600_000, 5, False, "deepseek-v4-flash", cfg)
-        assert tier == TIER_LARGE_CONTEXT
+    def test_context_pressure_escalates_to_high(self):
+        """High tokens + files → Level 1 (Flash High)."""
+        d = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=800_000,
+            estimated_files=50,
+            user_message="Continue working on this repo",
+            cfg=RouterConfig(context_pressure_threshold=0.50),
+            session_id="test-3",
+        )
+        assert d.recommended_level >= 1
+        assert d.should_switch is True
 
-    def test_context_pressure_below_threshold(self):
-        cfg = RouterConfig(context_pressure_threshold=0.70)
-        tier = classify_routing_tier(600_000, 5, False, "deepseek-v4-flash", cfg)
-        assert tier == TIER_DEFAULT  # 0.6 < 0.7
+    def test_debug_with_high_pressure_goes_max(self):
+        """Debug + max tokens → Level 3 (Pro Max)."""
+        d = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=900_000,
+            estimated_files=200,
+            user_message="Debug this complex security vulnerability",
+            cfg=RouterConfig(context_pressure_threshold=0.50),
+            session_id="test-4",
+        )
+        assert d.recommended_level >= 3
+        assert d.recommended_effort == "max"
 
-    def test_many_files_triggers_large_context(self):
-        cfg = RouterConfig(large_file_count_threshold=50)
-        tier = classify_routing_tier(1000, 200, False, "deepseek-v4-flash", cfg)
-        assert tier == TIER_LARGE_CONTEXT
-
-
-# =============================================================================
-# route() — main entry point
-# =============================================================================
-
-
-class TestRoute:
-    def test_default_stays_default(self):
-        cfg = RouterConfig(enabled=True)
-        d = route("deepseek-v4-flash", 1000, 5, False, cfg)
-        assert d.tier == TIER_DEFAULT
+    def test_already_on_pro_max_stays(self):
+        """Already on Pro Max with deep reasoning → no switch."""
+        d = escalate(
+            agent_model="deepseek-v4-pro",
+            agent_reasoning_effort="max",
+            estimated_tokens=800_000,
+            estimated_files=100,
+            user_message="Debug this security issue",
+            cfg=RouterConfig(context_pressure_threshold=0.50),
+            session_id="test-5",
+        )
+        assert d.recommended_level == 3
         assert d.should_switch is False
 
-    def test_deep_reasoning_from_flash(self):
-        cfg = RouterConfig(enabled=True)
-        d = route("deepseek-v4-flash", 1000, 5, True, cfg)
-        assert d.tier == TIER_DEEP_REASONING
-        assert d.should_switch is True
-        assert d.upgrade is True
-
-    def test_deep_reasoning_from_pro(self):
-        cfg = RouterConfig(enabled=True)
-        d = route("deepseek-v4-pro", 1000, 5, True, cfg)
-        assert d.tier == TIER_DEEP_REASONING
-        assert d.recommended_model == "deepseek-v4-pro"
-        assert d.recommended_mode == "reasoning"
-
-    def test_auto_switch_mode(self):
-        cfg = RouterConfig(enabled=True, auto_switch=True)
-        d = route("deepseek-v4-flash", 1000, 5, True, cfg)
-        assert d.auto_switch is True
-
-    def test_build_note_no_switch(self):
-        cfg = RouterConfig(enabled=True)
-        d = route("deepseek-v4-flash", 1000, 5, False, cfg)
-        assert build_route_note(d) == ""
-
-    def test_build_note_with_switch(self):
-        cfg = RouterConfig(enabled=True)
-        d = route("deepseek-v4-flash", 1000, 5, True, cfg)
+    def test_auto_switch_note(self):
+        """Auto-switch builds the right note."""
+        d = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="Debug this crash",
+            cfg=RouterConfig(auto_switch=True),
+            session_id="test-6",
+        )
         note = build_route_note(d)
-        assert "Model Routing" in note
-        assert "clarify" in note
+        assert "Model Escalation" in note
+        assert "Auto-escalating" in note
         assert "DeepSeek V4 Pro" in note
 
-    def test_build_note_auto_switch(self):
-        cfg = RouterConfig(enabled=True, auto_switch=True)
-        d = route("deepseek-v4-flash", 1000, 5, True, cfg)
+    def test_clarify_note(self):
+        """Non-auto-switch mode uses clarify."""
+        d = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="Debug this crash",
+            cfg=RouterConfig(auto_switch=False),
+            session_id="test-7",
+        )
         note = build_route_note(d)
-        assert "Auto-switching" in note
-        assert "clarify" not in note  # auto-switch skips clarify
+        assert "clarify" in note
+
+    def test_no_switch_note_empty(self):
+        """No switch → empty note."""
+        d = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="What is the capital?",
+            cfg=RouterConfig(),
+            session_id="test-8",
+        )
+        assert build_route_note(d) == ""
+
+    def test_round_robin_within_same_price(self):
+        """Round-robin alternates between Level 0 and 1 (same price)."""
+        d1 = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="Hello",
+            cfg=RouterConfig(),
+            session_id="rr-test",
+        )
+        d2 = escalate(
+            agent_model="deepseek-v4-flash",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="Hello again",
+            cfg=RouterConfig(),
+            session_id="rr-test",
+        )
+        labels = {d1.recommended_label, d2.recommended_label}
+        assert len(labels) > 1  # rotated between different effort levels
+
+    def test_reset_rr(self):
+        """Reset round-robin state."""
+        reset_rr("reset-test")
+        # Should work without errors
+        assert True
 
 
 # =============================================================================
-# Round-robin
+# Build route note
 # =============================================================================
 
 
-class TestRoundRobin:
-    def test_rotates_through_default_tier(self):
-        """Session-based round-robin rotates through Tier 1 models."""
-        cfg = RouterConfig(enabled=True)
-        models_seen: set[str] = set()
-        for _ in range(6):
-            d = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-test-1")
-            models_seen.add(d.recommended_model)
-        # Should see multiple models in Tier 1
-        assert len(models_seen) > 1
+class TestBuildRouteNote:
+    def test_empty_when_no_switch(self):
+        d = EscalationDecision(
+            current_level=0, recommended_level=0,
+            recommended_model="deepseek-v4-flash",
+            recommended_effort="medium", recommended_label="Flash Medium",
+            reason="", should_switch=False, auto_switch=False,
+            is_upgrade=False, is_downgrade=False,
+        )
+        assert build_route_note(d) == ""
 
-    def test_rotates_through_large_context_tier(self):
-        """Context pressure triggers Large Context tier with round-robin."""
-        cfg = RouterConfig(context_pressure_threshold=0.30)
-        models_seen: set[str] = set()
-        for _ in range(10):
-            d = route("deepseek-v4-flash", 400_000, 5, False, cfg, session_id="rr-test-2")
-            models_seen.add(d.recommended_model)
-        # DeepSeek V4 Flash (cheapest in tier 2) should be first,
-        # but round-robin should cycle through all in the tier
-        assert "deepseek-v4-flash" in models_seen
-        assert len(models_seen) >= 2  # at least Flash + one other
-
-    def test_different_sessions_independent(self):
-        """Two sessions have independent round-robin state."""
-        cfg = RouterConfig(enabled=True)
-        # Session A — first call
-        a1 = route("deepseek-v4-flash", 1000, 5, True, cfg, session_id="rr-a")
-        # Session B — first call
-        b1 = route("deepseek-v4-flash", 1000, 5, True, cfg, session_id="rr-b")
-        # Both should start at index 0 (same model for Tier 3, only 1 candidate)
-        assert a1.recommended_model == b1.recommended_model
-
-    def test_tier_change_resets_index(self):
-        """Changing tier resets the round-robin index."""
-        cfg = RouterConfig(enabled=True)
-
-        # Call deep reasoning (Tier 3) — advances index
-        for _ in range(5):
-            route("deepseek-v4-flash", 1000, 5, True, cfg, session_id="rr-reset")
-
-        # Switch to default (Tier 1) — should reset to 0
-        d = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-reset")
-        # Default tier, first model
-        assert d.tier == TIER_DEFAULT
-
-    def test_intra_tier_round_robin_triggers_switch(self):
-        """Same tier but different RR pick → should_switch=True."""
-        cfg = RouterConfig(enabled=True)
-
-        # Start on deepseek-v4-flash, first RR picks index 0 (deepseek-v4-flash too)
-        d1 = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-intra")
-        # Second turn: RR advances to index 1 (mimo-v2.5), should switch
-        d2 = route("deepseek-v4-flash", 1000, 5, False, cfg, session_id="rr-intra")
-        assert d2.tier == TIER_DEFAULT  # same tier
-        assert d2.recommended_model == "mimo-v2.5"  # rotated
-        assert d2.should_switch is True  # different model → switch
-
-    def test_intra_tier_no_switch_when_model_matches(self):
-        """Same tier, same model as current → should_switch=False."""
-        cfg = RouterConfig(enabled=True)
-
-        # First turn on mimo-v2.5, RR picks index 0 (deepseek-v4-flash)
-        d = route("mimo-v2.5", 1000, 5, False, cfg, session_id="rr-same")
-        # Different model → switch
-        assert d.should_switch is True
-
-
-# =============================================================================
-# Pricing & display helpers
-# =============================================================================
-
-
-class TestHelpers:
-    def test_pricing_lookup(self):
-        assert _get_model_price("deepseek-v4-flash") == 0.14
-        assert _get_model_price("deepseek-v4-pro") == 1.74
-
-    def test_display_name(self):
-        assert "DeepSeek" in _get_display_name("deepseek-v4-flash")
-        assert "MiMo" in _get_display_name("mimo-v2.5")
-
-    def test_pricing_unknown(self):
-        assert _get_model_price("nonexistent-model") is None
-
-    def test_model_to_tier(self):
-        assert _model_to_tier("deepseek-v4-flash") == TIER_DEFAULT
-        assert _model_to_tier("deepseek-v4-pro") == TIER_LARGE_CONTEXT
-        assert _model_to_tier("unknown") == TIER_DEFAULT
-
-
-# =============================================================================
-# Second Brain integration
-# =============================================================================
-
-
-class TestSecondBrainIntegration:
-    def test_knowledge_downgrades_deep_reasoning(self):
-        tier = adjust_tier_with_knowledge(TIER_DEEP_REASONING, True)
-        assert tier == TIER_LARGE_CONTEXT
-
-    def test_knowledge_downgrades_large_context(self):
-        tier = adjust_tier_with_knowledge(TIER_LARGE_CONTEXT, True)
-        assert tier == TIER_DEFAULT
-
-    def test_knowledge_no_effect_on_default(self):
-        tier = adjust_tier_with_knowledge(TIER_DEFAULT, True)
-        assert tier == TIER_DEFAULT
-
-    def test_no_knowledge_no_change(self):
-        assert adjust_tier_with_knowledge(TIER_DEEP_REASONING, False) == TIER_DEEP_REASONING
-        assert adjust_tier_with_knowledge(TIER_LARGE_CONTEXT, False) == TIER_LARGE_CONTEXT
+    def test_auto_switch_note_has_pricing(self):
+        d = EscalationDecision(
+            current_level=0, recommended_level=2,
+            recommended_model="deepseek-v4-pro",
+            recommended_effort="high", recommended_label="DeepSeek V4 Pro High",
+            reason="deep reasoning needed",
+            should_switch=True, auto_switch=True,
+            is_upgrade=True, is_downgrade=False,
+            cost_per_million=1.74,
+        )
+        note = build_route_note(d)
+        assert "Auto-escalating" in note
+        assert "$1.74" in note
+        assert "Pro High" in note

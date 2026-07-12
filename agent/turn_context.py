@@ -546,22 +546,15 @@ def build_turn_context(
                 est_tokens = estimate_request_tokens_rough(messages or [])
             except Exception:
                 pass
-            from agent.model_router import _detect_file_count_pressure, route, build_route_note
+            from agent.model_router import _detect_file_count_pressure, escalate, build_route_note
             est_files = _detect_file_count_pressure(messages or [])
 
-            is_deep = False
-            msg_lower = (original_user_message or "").lower()
-            for kw in ("debug", "diagnose", "troubleshoot", "root cause",
-                       "security", "investigate", "complex algorithm"):
-                if kw in msg_lower:
-                    is_deep = True
-                    break
-
-            decision = route(
-                current_model=getattr(agent, "model", "") or "",
+            decision = escalate(
+                agent_model=getattr(agent, "model", "") or "",
+                agent_reasoning_effort=getattr(agent, "reasoning_effort", "") or "medium",
                 estimated_tokens=est_tokens,
                 estimated_files=est_files,
-                is_deep_reasoning_task=is_deep,
+                user_message=original_user_message or "",
                 cfg=router_cfg,
                 session_id=agent.session_id or "",
             )
@@ -573,8 +566,9 @@ def build_turn_context(
                     else:
                         plugin_user_context = _note
                     logger.info(
-                        "Model router: tier=%s → %s (switch=%s reason=%s)",
-                        decision.tier, decision.recommended_model,
+                        "Model router: level=%s→%s (%s, effort=%s switch=%s reason=%s)",
+                        decision.current_level, decision.recommended_level,
+                        decision.recommended_model, decision.recommended_effort,
                         decision.should_switch, decision.reason,
                     )
     except Exception as exc:

@@ -532,8 +532,14 @@ def build_turn_context(
     # ── Intelligent Model Router ─────────────────────────────────────
     # 3-tier router: auto-detects context pressure, file count, and
     # reasoning depth to recommend or auto-switch the model.
+    # Only active on desktop UI — background flows (cron, subagents,
+    # terminal background) run with whatever model the user chose.
     try:
-        router_cfg = RouterConfig.from_config(agent.__dict__.get("config", {}))
+        _platform = getattr(agent, "platform", None) or ""
+        if _platform != "desktop":
+            router_cfg = RouterConfig()  # disabled fallback
+        else:
+            router_cfg = RouterConfig.from_config(agent.__dict__.get("config", {}))
         if router_cfg.enabled:
             est_tokens = 0
             try:

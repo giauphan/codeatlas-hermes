@@ -170,6 +170,16 @@ def _requires_deep_reasoning(user_message: str) -> bool:
     return False
 
 
+def _requires_refactoring(user_message: str) -> bool:
+    """Check if the request involves refactoring code."""
+    msg = (user_message or "").lower()
+    for kw in ("refactor", "restructure", "rewrite", "reorganize",
+               "migrate code", "extract", "split file"):
+        if kw in msg:
+            return True
+    return False
+
+
 # ── Escalate ────────────────────────────────────────────────────────────────
 
 
@@ -184,6 +194,7 @@ def _target_level(
     estimated_tokens: int,
     estimated_files: int,
     deep_reasoning: bool,
+    refactoring: bool,
     cfg: RouterConfig,
 ) -> int:
     """Determine the appropriate escalation level for this request.
@@ -191,23 +202,26 @@ def _target_level(
     Rules:
       - Deep reasoning + high token pressure → Level 3 (Pro Max)
       - Deep reasoning → Level 2 (Pro High) minimum
-      - High token pressure or many files → Level 1 (Flash High) minimum
+      - Complex refactor (10+ files or 100K+ tokens) → Level 2 (Pro High)
+      - Medium refactor (3-9 files or 30K+ tokens) → Level 1 (Flash High)
+      - High token pressure or many files → Level 1 (Flash High)
       - Everything else → Level 0 (Flash Medium)
     """
     ctx_len = 1_000_000
     pressure = estimated_tokens / ctx_len if ctx_len > 0 else 0
 
-    # Detect "still insufficient" from repeated tool calls + failures
-    # For now, use token pressure as a proxy
-
     if deep_reasoning and pressure >= cfg.context_pressure_threshold:
         return max(current_level, 3)  # Pro Max
     if deep_reasoning:
         return max(current_level, 2)  # Pro High
+    if refactoring and (estimated_files >= 10 or estimated_tokens >= 100_000):
+        return max(current_level, 2)  # Complex refactor → Pro High
+    if refactoring and (estimated_files >= 3 or estimated_tokens >= 30_000):
+        return max(current_level, 1)  # Medium refactor → Flash High
     if pressure >= cfg.context_pressure_threshold or estimated_files >= cfg.large_file_count_threshold:
         return max(current_level, 1)  # Flash High
     if estimated_files >= 50:
-        return max(current_level, 1)  # Moderate file count → Flash High
+        return max(current_level, 1)  # Flash High
 
     return 0  # Flash Medium
 
@@ -241,9 +255,10 @@ def escalate(
     # Detect current level
     current = _current_level(agent_model, agent_reasoning_effort)
     deep_reasoning = _requires_deep_reasoning(user_message)
+    refactoring = _requires_refactoring(user_message)
 
     # Determine target level
-    target = _target_level(current, estimated_tokens, estimated_files, deep_reasoning, cfg)
+    target = _target_level(current, estimated_tokens, estimated_files, deep_reasoning, refactoring, cfg)
 
     # Round-robin within the same cost bracket (Level 0↔1 both $0.14, Level 2↔3 both $1.74)
     # Rotate when staying at same level; escalate UP when task demands;

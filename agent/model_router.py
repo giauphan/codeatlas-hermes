@@ -158,38 +158,115 @@ def _detect_file_count_pressure(messages: List[Dict[str, Any]]) -> int:
     return count
 
 
-def _requires_deep_reasoning(user_message: str) -> bool:
-    """Check if the request requires deep reasoning (debug, security, etc.)."""
-    msg = (user_message or "").lower()
-    for kw in ("debug", "diagnose", "troubleshoot", "root cause",
-               "security", "investigate", "complex algorithm",
-               "vulnerability", "exploit", "reverse engineer",
-               "cryptography", "formal verification",
-               "architecture proposal", "design proposal"):
-        if kw in msg:
-            return True
-    return False
+def _analyze_complexity(user_message: str) -> int:
+    """Analyze user message and return complexity level 0-3.
 
+    Reads the actual prompt content and scores it on:
+      - Message length (long → complex)
+      - Code blocks, diffs, stack traces
+      - Multi-part requests (lists, numbered items)
+      - Technical depth (file paths, error messages)
+      - Semantic depth (debug, security, architecture keywords)
 
-def _requires_refactoring(user_message: str) -> bool:
-    """Check if the request involves refactoring code."""
-    msg = (user_message or "").lower()
-    for kw in ("refactor", "restructure", "rewrite", "reorganize",
-               "migrate code", "extract", "split file"):
-        if kw in msg:
-            return True
-    return False
+    Returns 0 (trivial) up to 3 (very complex).
+    """
+    msg = (user_message or "").strip()
+    if not msg:
+        return 0
 
+    score = 0
+    lines = msg.split("\n")
+    words = msg.split()
+    msg_lower = msg.lower()
 
-def _is_complex_analysis(user_message: str) -> bool:
-    """Check if the request is a complex analysis task (architecture, research)."""
-    msg = (user_message or "").lower()
-    for kw in ("analyze project", "architecture analysis", "project audit",
-               "research", "codebase analysis", "repository-wide",
-               "design architecture", "system design", "technical proposal"):
-        if kw in msg:
-            return True
-    return False
+    # ── Length signals ──────────────────────────────────────────
+    word_count = len(words)
+    line_count = len(lines)
+
+    if word_count >= 500:
+        score += 3
+    elif word_count >= 200:
+        score += 2
+    elif word_count >= 50:
+        score += 1
+
+    if line_count >= 100:
+        score += 2
+    elif line_count >= 30:
+        score += 1
+    elif line_count >= 10:
+        score += 1
+
+    # ── Code blocks & technical structure ───────────────────────
+    code_block_count = msg.count("```")
+    if code_block_count >= 6:
+        score += 2
+    elif code_block_count >= 2:
+        score += 1
+
+    if "diff --git" in msg or "--- a/" in msg:
+        score += 1
+
+    # ── Multi-part / structured requests ────────────────────────
+    if "\n-" in msg or "\n*" in msg:
+        score += 1
+    if "\n1." in msg or "\n2." in msg or "\n3." in msg:
+        score += 1
+
+    # ── Technical depth ─────────────────────────────────────────
+    file_refs = sum(1 for w in words if "/" in w and "." in w)
+    if file_refs >= 10:
+        score += 2
+    elif file_refs >= 3:
+        score += 1
+
+    if msg.count("?") >= 5:
+        score += 1
+
+    if "Traceback" in msg or "Error:" in msg or "Exception" in msg:
+        score += 2
+
+    # ── Semantic depth ──────────────────────────────────────────
+    # Debugging / root cause / troubleshooting — strong signal
+    has_debug = any(kw in msg_lower for kw in ("debug", "root cause", "troubleshoot", "diagnose"))
+    has_security = any(kw in msg_lower for kw in ("security", "investigate", "vulnerability"))
+    if has_debug:
+        score += 3  # Debugging alone bumps to Level 2
+    if has_security:
+        score += 3  # Security alone bumps to Level 2
+    if has_debug and "root cause" in msg_lower:
+        score += 1  # Combo: debug + root cause → Pro Max territory
+
+    # Architecture / research / analysis — needs analytical effort
+    for kw in ("architecture", "proposal", "research", "codebase analysis",
+               "analyze project", "repository-wide", "system design",
+               "technical proposal"):
+        if kw in msg_lower:
+            score += 2
+            break
+
+    # Refactoring / restructuring — moderate complexity
+    for kw in ("refactor", "restructure", "migrate code", "extract",
+               "split file", "rewrite"):
+        if kw in msg_lower:
+            score += 1
+            break
+
+    # Multiple tasks = higher complexity
+    task_indicators = msg_lower.count(" - check") + msg_lower.count(" - add") + \
+                      msg_lower.count(" - update") + msg_lower.count(" - fix") + \
+                      msg_lower.count(" - create")
+    if task_indicators >= 3:
+        score += 1
+
+    # ── Map score to level ──────────────────────────────────────
+    if score >= 8:
+        return 3  # Very complex — Pro Max
+    if score >= 3:
+        return 2  # Complex — Pro Medium
+    if score >= 2:
+        return 1  # Moderate — Flash Max
+    return 0  # Simple — Flash Medium
 
 
 # ── Escalate ────────────────────────────────────────────────────────────────
@@ -205,39 +282,37 @@ def _target_level(
     current_level: int,
     estimated_tokens: int,
     estimated_files: int,
-    deep_reasoning: bool,
-    refactoring: bool,
-    complex_analysis: bool,
+    complexity: int,
     cfg: RouterConfig,
 ) -> int:
-    """Determine the appropriate escalation level for this request.
+    """Determine the appropriate escalation level based on actual analysis.
 
-    Rules:
-      - Deep reasoning + high token pressure → Level 3 (Pro Max)
-      - Deep reasoning → Level 2 (Pro Medium) minimum
-      - Complex analysis / architecture / research → Level 2 (Pro Medium)
-      - Complex refactor (6+ files or 150K+ tokens) → Level 2 (Pro Medium)
-      - Medium refactor (3-5 files or 30K+ tokens) → Level 1 (Flash Max)
-      - High token pressure or many files → Level 1 (Flash High)
-      - Everything else → Level 0 (Flash Medium)
+    Uses BOTH content analysis (complexity 0-3) and runtime metrics
+    (tokens, files) to decide.
     """
     ctx_len = 1_000_000
     pressure = estimated_tokens / ctx_len if ctx_len > 0 else 0
 
-    if deep_reasoning and pressure >= cfg.context_pressure_threshold:
+    # ── Highest priority: runtime metrics ──
+    if pressure >= cfg.context_pressure_threshold:
         return max(current_level, 3)  # Pro Max
-    if deep_reasoning:
+
+    if estimated_files >= cfg.large_file_count_threshold:
         return max(current_level, 2)  # Pro Medium
-    if complex_analysis:
+
+    # ── Content analysis ──
+    if complexity >= 3:
+        return max(current_level, 3)  # Pro Max
+    if complexity >= 2:
         return max(current_level, 2)  # Pro Medium
-    if refactoring and (estimated_files >= 6 or estimated_tokens >= 150_000):
-        return max(current_level, 2)  # Complex refactor → Pro Medium
-    if refactoring and (estimated_files >= 3 or estimated_tokens >= 30_000):
-        return max(current_level, 1)  # Medium refactor → Flash Max
-    if pressure >= cfg.context_pressure_threshold or estimated_files >= cfg.large_file_count_threshold:
-        return max(current_level, 1)  # Flash High
+    if complexity >= 1:
+        return max(current_level, 1)  # Flash Max
+
+    # ── Secondary metrics ──
     if estimated_files >= 50:
-        return max(current_level, 1)  # Flash High
+        return max(current_level, 1)
+    if estimated_tokens >= 100_000:
+        return max(current_level, 1)
 
     return 0  # Flash Medium
 
@@ -270,12 +345,10 @@ def escalate(
     """
     # Detect current level
     current = _current_level(agent_model, agent_reasoning_effort)
-    deep_reasoning = _requires_deep_reasoning(user_message)
-    refactoring = _requires_refactoring(user_message)
-    complex_analysis = _is_complex_analysis(user_message)
+    complexity = _analyze_complexity(user_message)
 
-    # Determine target level
-    target = _target_level(current, estimated_tokens, estimated_files, deep_reasoning, refactoring, complex_analysis, cfg)
+    # Determine target level (complexity + runtime metrics)
+    target = _target_level(current, estimated_tokens, estimated_files, complexity, cfg)
 
     # Round-robin within the same cost bracket (Level 0↔1 both $0.14, Level 2↔3 both $1.74)
     # Rotate when staying at same level; escalate UP when task demands;
@@ -301,7 +374,7 @@ def escalate(
             chosen = target
     elif target == 2 or target == 3:
         # Pro tier — alternate between High and Max if needed
-        if deep_reasoning and current < 3 and estimated_tokens >= 700_000:
+        if complexity >= 2 and current < 3 and estimated_tokens >= 700_000:
             chosen = 3  # Force Pro Max on high pressure + reasoning
         elif current == 2 and target == 2:
             candidates = [2, 3] if session_id else [2]
@@ -322,7 +395,7 @@ def escalate(
     # Build reason
     reasons = []
     if is_upgrade:
-        if deep_reasoning:
+        if complexity >= 2:
             reasons.append("deep reasoning needed")
         if estimated_tokens >= 500_000:
             reasons.append(f"context pressure ({estimated_tokens:,} tokens)")

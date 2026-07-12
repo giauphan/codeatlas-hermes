@@ -13,7 +13,7 @@ from agent.model_router import (
     ESCALATION,
     escalate,
     build_route_note,
-    _requires_deep_reasoning,
+    _analyze_complexity,
     _detect_file_count_pressure,
     reset_rr,
 )
@@ -66,18 +66,34 @@ class TestRouterConfig:
 # =============================================================================
 
 
-class TestDeepReasoning:
-    def test_detects_debug(self):
-        assert _requires_deep_reasoning("debug this crash") is True
+class TestAnalyzeComplexity:
+    def test_simple_question_is_low(self):
+        assert _analyze_complexity("What is the capital?") == 0
 
-    def test_detects_security(self):
-        assert _requires_deep_reasoning("security audit needed") is True
+    def test_short_code_question_is_low(self):
+        assert _analyze_complexity("How do I write a function?") == 0
 
-    def test_normal_question(self):
-        assert _requires_deep_reasoning("What is the capital?") is False
+    def test_debug_query_is_medium(self):
+        """Debug keywords bump complexity to at least 1."""
+        assert _analyze_complexity("Debug this crash and find root cause") >= 1
 
-    def test_refactor_not_deep(self):
-        assert _requires_deep_reasoning("Refactor the auth module") is False
+    def test_refactor_with_list_is_medium(self):
+        msg = "Refactor the auth module\n- Move login to its own file\n- Update imports\n- Add error handling"
+        assert _analyze_complexity(msg) >= 1
+
+    def test_long_complex_analysis_is_high(self):
+        """Long multi-part request with architecture keyword."""
+        msg = (
+            "Analyze the entire project architecture:\n"
+            "- Check all modules\n"
+            "- Identify bottlenecks\n"
+            "- Suggest improvements\n"
+            "- Review the auth module\n"
+            "- Check database layer\n\n"
+            "```python\ndef foo():\n    pass\n```\n\n"
+            "```javascript\nfunction bar() {}\n```"
+        )
+        assert _analyze_complexity(msg) >= 2
 
 
 # =============================================================================

@@ -1174,8 +1174,8 @@ DEFAULT_CONFIG = {
         # route requests to the most appropriate model.  Disabled by
         # default (opt-in).  When enabled, supersedes model_recommendation.
         "model_router": {
-            "enabled": False,
-            "auto_switch": False,
+            "enabled": True,
+            "auto_switch": True,
             "context_pressure_threshold": 0.70,
             "large_file_count_threshold": 100,
         },

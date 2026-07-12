@@ -559,18 +559,37 @@ def build_turn_context(
                 session_id=agent.session_id or "",
             )
             if decision.should_switch:
-                _note = build_route_note(decision)
-                if _note:
-                    if plugin_user_context:
-                        plugin_user_context += "\n\n" + _note
-                    else:
-                        plugin_user_context = _note
-                    logger.info(
-                        "Model router: level=%s→%s (%s, effort=%s switch=%s reason=%s)",
-                        decision.current_level, decision.recommended_level,
-                        decision.recommended_model, decision.recommended_effort,
-                        decision.should_switch, decision.reason,
-                    )
+                if decision.auto_switch and decision.recommended_model:
+                    # Actually perform the model switch (not just inject note)
+                    try:
+                        from agent.agent_runtime_helpers import switch_model
+                        _model_id = decision.recommended_model
+                        _provider = getattr(agent, "provider", None) or ""
+                        _base_url = getattr(agent, "base_url", None) or ""
+                        switch_model(agent, _model_id, _provider, base_url=_base_url)
+                        # Update reasoning effort
+                        agent.reasoning_effort = decision.recommended_effort
+                        # Update config for next turn
+                        _config = getattr(agent, "config", {})
+                        if isinstance(_config, dict):
+                            _agent = _config.get("agent", {})
+                            if isinstance(_agent, dict):
+                                _agent["reasoning_effort"] = decision.recommended_effort
+                        logger.info(
+                            "Model router: SWITCHED %s → %s (effort=%s, reason=%s)",
+                            getattr(agent, "model", "?"), _model_id,
+                            decision.recommended_effort, decision.reason,
+                        )
+                    except Exception as switch_err:
+                        logger.warning("Model router: switch_model failed: %s", switch_err)
+                # Still inject note for non-auto mode (clarify fallback)
+                if not decision.auto_switch:
+                    _note = build_route_note(decision)
+                    if _note:
+                        if plugin_user_context:
+                            plugin_user_context += "\n\n" + _note
+                        else:
+                            plugin_user_context = _note
     except Exception as exc:
         logger.debug("Model router check failed: %s", exc)
 

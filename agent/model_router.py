@@ -246,13 +246,13 @@ def escalate(
     target = _target_level(current, estimated_tokens, estimated_files, deep_reasoning, cfg)
 
     # Round-robin within the same cost bracket (Level 0↔1 both $0.14, Level 2↔3 both $1.74)
-    # Only rotate when staying at the same level — escalating always goes to target.
-    # Auto-switch NEVER downgrades: if user chose a stronger model, respect it.
+    # Rotate when staying at same level; escalate UP when task demands;
+    # descend DOWN when task becomes simple again (cost optimization).
     if target > current:
         chosen = target
     elif target < current:
-        # User chose a stronger model — respect it, don't auto-downgrade
-        chosen = current
+        # Task became simpler — descend DOWN to save cost
+        chosen = target
     elif target == 0:
         # Alternate between Flash Medium and Flash High (same price)
         candidates = [0, 1]

@@ -529,4 +529,31 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    # ── Post-turn GC ────────────────────────────────────────────
+    # Each turn accumulates tool results, file contents, and
+    # conversation context.  Forcing a GC release after every turn
+    # prevents these transient objects from growing resident memory
+    # across hundreds of turns.
+    try:
+        import gc
+        before = _rss_mb()
+        freed = gc.collect()
+        after = _rss_mb()
+        if freed > 0 and agent._log_trace:
+            logger.debug("post-turn gc: %d freed (%.0f → %.0f MB)", freed, before, after)
+    except Exception:
+        pass
+
     return result
+
+
+def _rss_mb() -> float:
+    """Return current RSS in MB (cross-platform)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0

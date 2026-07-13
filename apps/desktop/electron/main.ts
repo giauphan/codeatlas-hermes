@@ -204,6 +204,8 @@ ipcMain.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
 app.commandLine.appendSwitch('disable-renderer-backgrounding')
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
 app.commandLine.appendSwitch('disable-background-timer-throttling')
+app.commandLine.appendSwitch('no-zygote')
+app.commandLine.appendSwitch('no-sandbox')
 
 const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 

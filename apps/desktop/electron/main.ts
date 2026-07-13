@@ -206,6 +206,13 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
 app.commandLine.appendSwitch('disable-background-timer-throttling')
 app.commandLine.appendSwitch('no-zygote')
 app.commandLine.appendSwitch('no-sandbox')
+// ── Memory limit ──────────────────────────────────────────────
+// Cap each renderer's V8 heap to 1 GB so a single leaky session
+// can't eat 12+ GB.  Also limit Chromium to one renderer process
+// so memory is contained in a single heap.
+app.commandLine.appendSwitch('renderer-process-limit', '1')
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=1024')
+// ── End memory limit ──────────────────────────────────────────
 
 const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 
@@ -9041,6 +9048,34 @@ app.whenReady().then(() => {
       focusWindow(mainWindow)
     }
   })
+
+  // ── Memory watchdog ──────────────────────────────────────────
+  // Every 5 minutes, check overall process memory and warn when
+  // the Electron main + renderer are using too much.  The V8 heap
+  // limit above (--max-old-space-size=1024) keeps the renderer from
+  // claiming 12+ GB; this alert makes a steady leak visible early.
+  const MEMORY_WARN_MB = 1200   // warn when rss > 1.2 GB
+  const MEMORY_CRIT_MB = 1800   // critical when rss > 1.8 GB
+  setInterval(() => {
+    try {
+      const usage = process.memoryUsage()
+      const rssMb = Math.round(usage.rss / 1024 / 1024)
+      const heapMb = Math.round(usage.heapUsed / 1024 / 1024)
+      if (rssMb > MEMORY_CRIT_MB) {
+        console.warn(
+          `[hermes] ⚠ Process memory CRITICAL: ${rssMb} MB ` +
+          `(heap=${heapMb} MB, windows=${BrowserWindow.getAllWindows().length}). ` +
+          `Consider restarting Hermes.`
+        )
+      } else if (rssMb > MEMORY_WARN_MB) {
+        console.warn(
+          `[hermes] ⚠ Process memory HIGH: ${rssMb} MB ` +
+          `(heap=${heapMb} MB, windows=${BrowserWindow.getAllWindows().length}).`
+        )
+      }
+    } catch (_) { /* ignore */ }
+  }, 5 * 60 * 1000) // every 5 minutes
+  // ── End memory watchdog ───────────────────────────────────────
 })
 
 // Seed Chromium's spellchecker with the system locale (falling back to en-US).

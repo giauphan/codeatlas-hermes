@@ -343,6 +343,27 @@ def escalate(
     Returns:
         EscalationDecision with the recommended level and model.
     """
+    # Bypassing escalation for custom 9Router / round-robin combo models
+    model_lower = (agent_model or "").lower()
+    if (
+        "9router" in model_lower
+        or "round-robin" in model_lower
+        or "round_robin" in model_lower
+    ):
+        return EscalationDecision(
+            current_level=0,
+            recommended_level=0,
+            recommended_model=agent_model,
+            recommended_effort=agent_reasoning_effort,
+            recommended_label=agent_model,
+            reason="custom combo / round-robin model active, skipping escalation",
+            should_switch=False,
+            auto_switch=cfg.auto_switch,
+            is_upgrade=False,
+            is_downgrade=False,
+            cost_per_million=0.0,
+        )
+
     # Detect current level
     current = _current_level(agent_model, agent_reasoning_effort)
     complexity = _analyze_complexity(user_message)

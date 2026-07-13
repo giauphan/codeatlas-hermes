@@ -248,6 +248,36 @@ class TestEscalate:
         # Should work without errors
         assert True
 
+    def test_9router_bypass_escalation(self):
+        """9router model bypasses escalation regardless of complexity/tokens."""
+        d = escalate(
+            agent_model="9router",
+            agent_reasoning_effort="medium",
+            estimated_tokens=800_000,
+            estimated_files=100,
+            user_message="Debug this crash and find root cause",
+            cfg=RouterConfig(),
+            session_id="test-9router",
+        )
+        assert d.recommended_model == "9router"
+        assert d.should_switch is False
+        assert d.reason == "custom combo / round-robin model active, skipping escalation"
+
+    def test_round_robin_bypass_escalation(self):
+        """nvidia-round-robin model bypasses escalation regardless of complexity/tokens."""
+        d = escalate(
+            agent_model="nvidia-round-robin",
+            agent_reasoning_effort="medium",
+            estimated_tokens=800_000,
+            estimated_files=100,
+            user_message="Debug this crash and find root cause",
+            cfg=RouterConfig(),
+            session_id="test-rr",
+        )
+        assert d.recommended_model == "nvidia-round-robin"
+        assert d.should_switch is False
+        assert d.reason == "custom combo / round-robin model active, skipping escalation"
+
 
 # =============================================================================
 # Build route note

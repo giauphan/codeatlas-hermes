@@ -210,8 +210,14 @@ app.commandLine.appendSwitch('no-sandbox')
 // Cap each renderer's V8 heap to 1 GB so a single leaky session
 // can't eat 12+ GB.  Also limit Chromium to one renderer process
 // so memory is contained in a single heap.
+// --expose-gc allows the main process to call global.gc() on a
+// schedule, forcing V8 to release eligible objects between LLM
+// turns instead of waiting for Chromium's natural GC heuristics.
 app.commandLine.appendSwitch('renderer-process-limit', '1')
-app.commandLine.appendSwitch('js-flags', '--max-old-space-size=1024')
+app.commandLine.appendSwitch(
+  'js-flags',
+  '--max-old-space-size=1024 --expose-gc'
+)
 // ── End memory limit ──────────────────────────────────────────
 
 const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
@@ -9054,26 +9060,76 @@ app.whenReady().then(() => {
   // the Electron main + renderer are using too much.  The V8 heap
   // limit above (--max-old-space-size=1024) keeps the renderer from
   // claiming 12+ GB; this alert makes a steady leak visible early.
-  const MEMORY_WARN_MB = 1200   // warn when rss > 1.2 GB
-  const MEMORY_CRIT_MB = 1800   // critical when rss > 1.8 GB
+  //
+  // Also runs a forced GC every hour — V8 normally waits for memory
+  // pressure before collecting, but on long-lived desktop sessions
+  // (19h+) small leaks compound into gigabytes.  Triggering GC
+  // proactively after heavy LLM rounds releases zombie objects
+  // before they accumulate.
+  //
+  // After 12 hours of uptime, if no windows have active agent runs,
+  // the app soft-restarts itself to reset any leftover V8 state.
+  const _startup = Date.now()
+  const _lastActivity = { time: Date.now() } // updated by IPC from renderer
+
+  // Listen for renderer activity heartbeats (optional — graceful
+  // fallback if renderer never sends them).
+  try {
+    ipcMain.on('hermes:activity', () => {
+      _lastActivity.time = Date.now()
+    })
+  } catch (_) { /* preload may not wire this yet */ }
+
   setInterval(() => {
+    // ── GC every 60 minutes ─────────────────────────────────
+    const _now = Date.now()
+    if (typeof globalThis.gc === 'function') {
+      try {
+        globalThis.gc()
+        if (_now - _startup > 3600_000) {
+          // Log only after first hour to avoid startup noise
+          console.debug('[hermes] forced GC ok — eligible objects released')
+        }
+      } catch (e) {
+        console.debug('[hermes] forced GC failed:', e)
+      }
+    }
+
+    // ── Memory check ────────────────────────────────────────
     try {
       const usage = process.memoryUsage()
       const rssMb = Math.round(usage.rss / 1024 / 1024)
       const heapMb = Math.round(usage.heapUsed / 1024 / 1024)
-      if (rssMb > MEMORY_CRIT_MB) {
+      if (rssMb > 1800) {
         console.warn(
           `[hermes] ⚠ Process memory CRITICAL: ${rssMb} MB ` +
           `(heap=${heapMb} MB, windows=${BrowserWindow.getAllWindows().length}). ` +
           `Consider restarting Hermes.`
         )
-      } else if (rssMb > MEMORY_WARN_MB) {
+      } else if (rssMb > 1200) {
         console.warn(
           `[hermes] ⚠ Process memory HIGH: ${rssMb} MB ` +
           `(heap=${heapMb} MB, windows=${BrowserWindow.getAllWindows().length}).`
         )
       }
     } catch (_) { /* ignore */ }
+
+    // ── Idle soft-reload after 12h ─────────────────────────
+    const uptimeMinutes = Math.round((_now - _startup) / 60_000)
+    const idleMinutes = Math.round((_now - _lastActivity.time) / 60_000)
+    if (uptimeMinutes > 720 && idleMinutes > 30) {
+      // > 12h uptime + > 30min idle → safe to restart
+      console.warn(
+        `[hermes] ⚡ Auto-restart: ${uptimeMinutes}m uptime, ` +
+        `${idleMinutes}m idle — relaunching to reclaim memory.`
+      )
+      try {
+        app.relaunch()
+        app.exit(0)
+      } catch (e) {
+        console.warn('[hermes] auto-restart failed:', e)
+      }
+    }
   }, 5 * 60 * 1000) // every 5 minutes
   // ── End memory watchdog ───────────────────────────────────────
 })

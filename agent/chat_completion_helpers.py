@@ -1339,6 +1339,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    current_model = (getattr(agent, "model", "") or "").strip()
+    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    logger.info(
+        "try_activate_fallback called: reason=%s, current_model=%s, current_provider=%s, fallback_index=%s/%s",
+        reason,
+        current_model,
+        current_provider,
+        getattr(agent, "_fallback_index", 0),
+        len(getattr(agent, "_fallback_chain", [])),
+    )
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1498,6 +1508,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
         old_provider = agent.provider
+
+        logger.info(
+            "Fallback/escalation active: switching model from %s (%s) to %s (%s) via api_mode=%s",
+            old_model, old_provider, fb_model, fb_provider, fb_api_mode
+        )
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting

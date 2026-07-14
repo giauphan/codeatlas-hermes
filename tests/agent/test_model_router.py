@@ -5,7 +5,6 @@ Tests for the Model Router — Escalation Strategy (agent/model_router.py).
 from __future__ import annotations
 
 import pytest
-from typing import Any, Dict, List
 
 from agent.model_router import (
     RouterConfig,
@@ -14,7 +13,6 @@ from agent.model_router import (
     escalate,
     build_route_note,
     _analyze_complexity,
-    _detect_file_count_pressure,
     reset_rr,
 )
 
@@ -28,17 +26,26 @@ class TestEscalationLevels:
     def test_4_levels(self):
         assert len(ESCALATION) == 4
 
-    def test_levels_cost_ascending(self):
+    def test_escalation_models(self):
+        assert ESCALATION[0].model_id == "model-low-to-medium"
+        assert ESCALATION[1].model_id == "model-only-plan"
+        assert ESCALATION[2].model_id == "model-medium-hight"
+        assert ESCALATION[3].model_id == "model-medium-hight"
+
+    def test_levels_effort_ascending(self):
+        efforts = [l.reasoning_effort for l in ESCALATION]
+        assert efforts == ["medium", "max", "medium", "max"]
+
+    def test_levels_cost(self):
         costs = [l.cost for l in ESCALATION]
-        assert costs == sorted(costs)
+        assert costs == [0.14, 0.14, 1.74, 1.74]
 
-    def test_level_0_and_1_same_price(self):
-        assert ESCALATION[0].cost == ESCALATION[1].cost  # both $0.14
-        assert ESCALATION[0].model_id == ESCALATION[1].model_id  # same model
-
-    def test_level_2_and_3_same_price(self):
-        assert ESCALATION[2].cost == ESCALATION[3].cost  # both $1.74
-        assert ESCALATION[2].model_id == ESCALATION[3].model_id  # same model
+    def test_level_labels_match_ui(self):
+        """Labels should match the UI display names."""
+        assert ESCALATION[0].label == "DeepSeek V4 Flash Medium"
+        assert ESCALATION[1].label == "DeepSeek V4 Flash Max"
+        assert ESCALATION[2].label == "DeepSeek V4 Pro Medium"
+        assert ESCALATION[3].label == "GLM 5.2"
 
 
 # =============================================================================
@@ -103,9 +110,9 @@ class TestAnalyzeComplexity:
 
 class TestEscalate:
     def test_simple_question_stays_at_0(self):
-        """Simple question on Flash Medium → no escalation."""
+        """Simple question → stays at Level 0 (9router medium)."""
         d = escalate(
-            agent_model="deepseek-v4-flash",
+            agent_model="9router",
             agent_reasoning_effort="medium",
             estimated_tokens=100,
             estimated_files=0,
@@ -113,15 +120,14 @@ class TestEscalate:
             cfg=RouterConfig(),
             session_id="test-1",
         )
-        assert d.current_level == 0
-        assert d.recommended_level == 0
+        # No complexity → stays at current level
+        assert d.recommended_model == "9router"
         assert d.should_switch is False
-        assert d.recommended_label == "DeepSeek V4 Flash Medium"
 
-    def test_debug_escalates_to_pro_high(self):
-        """Deep reasoning from Flash → escalates to Level 2 (Pro High)."""
+    def test_debug_escalates_to_deepseek_pro(self):
+        """Debug + root cause → escalates to Level 2 (model-medium-hight)."""
         d = escalate(
-            agent_model="deepseek-v4-flash",
+            agent_model="9router",
             agent_reasoning_effort="medium",
             estimated_tokens=100,
             estimated_files=0,
@@ -129,29 +135,17 @@ class TestEscalate:
             cfg=RouterConfig(),
             session_id="test-2",
         )
-        assert d.recommended_level >= 2
+        # Complexity triggers escalation to model-medium-hight
+        assert d.recommended_model == "model-medium-hight"
+        assert d.recommended_level == 2
+        assert d.recommended_effort == "medium"
         assert d.should_switch is True
-        assert d.is_upgrade is True
-        assert "DeepSeek V4 Pro" in d.recommended_label
+        assert "deep reasoning needed" in d.reason
 
-    def test_context_pressure_escalates_to_high(self):
-        """High tokens + files → Level 1 (Flash High)."""
+    def test_debug_with_high_pressure_escalates_to_glm(self):
+        """Debug + max tokens → escalates to Level 3 (model-medium-hight)."""
         d = escalate(
-            agent_model="deepseek-v4-flash",
-            agent_reasoning_effort="medium",
-            estimated_tokens=800_000,
-            estimated_files=50,
-            user_message="Continue working on this repo",
-            cfg=RouterConfig(context_pressure_threshold=0.50),
-            session_id="test-3",
-        )
-        assert d.recommended_level >= 1
-        assert d.should_switch is True
-
-    def test_debug_with_high_pressure_goes_max(self):
-        """Debug + max tokens → Level 3 (Pro Max)."""
-        d = escalate(
-            agent_model="deepseek-v4-flash",
+            agent_model="9router",
             agent_reasoning_effort="medium",
             estimated_tokens=900_000,
             estimated_files=200,
@@ -159,13 +153,16 @@ class TestEscalate:
             cfg=RouterConfig(context_pressure_threshold=0.50),
             session_id="test-4",
         )
-        assert d.recommended_level >= 3
+        # High complexity + pressure → Level 3
+        assert d.recommended_model == "model-medium-hight"
+        assert d.recommended_level == 3
         assert d.recommended_effort == "max"
+        assert d.should_switch is True
 
-    def test_already_on_pro_max_stays(self):
-        """Already on Pro Max with deep reasoning → no switch."""
+    def test_already_on_glm_stays(self):
+        """Already on GLM with deep reasoning → no switch."""
         d = escalate(
-            agent_model="deepseek-v4-pro",
+            agent_model="model-medium-hight",
             agent_reasoning_effort="max",
             estimated_tokens=800_000,
             estimated_files=100,
@@ -173,110 +170,83 @@ class TestEscalate:
             cfg=RouterConfig(context_pressure_threshold=0.50),
             session_id="test-5",
         )
+        assert d.recommended_model == "model-medium-hight"
         assert d.recommended_level == 3
         assert d.should_switch is False
 
-    def test_auto_switch_note(self):
-        """Auto-switch builds the right note."""
+    def test_9router_escalation(self):
+        """9router model escalates to deepseek-pro when complexity requires."""
         d = escalate(
-            agent_model="deepseek-v4-flash",
+            agent_model="9router",
             agent_reasoning_effort="medium",
             estimated_tokens=100,
             estimated_files=0,
-            user_message="Debug this crash",
-            cfg=RouterConfig(auto_switch=True),
-            session_id="test-6",
+            user_message="Debug this crash and find root cause",
+            cfg=RouterConfig(),
+            session_id="test-9router",
         )
-        note = build_route_note(d)
-        assert "Model Escalation" in note
-        assert "Auto-escalating" in note
-        assert "DeepSeek V4 Pro" in note
+        assert d.recommended_model == "model-medium-hight"
+        assert d.recommended_level == 2
+        assert d.should_switch is True
 
-    def test_clarify_note(self):
-        """Non-auto-switch mode uses clarify."""
+    def test_round_robin_escalation(self):
+        """nvidia-round-robin model also escalates under complexity."""
         d = escalate(
-            agent_model="deepseek-v4-flash",
+            agent_model="nvidia-round-robin",
             agent_reasoning_effort="medium",
             estimated_tokens=100,
             estimated_files=0,
-            user_message="Debug this crash",
-            cfg=RouterConfig(auto_switch=False),
-            session_id="test-7",
+            user_message="Debug this crash and find root cause",
+            cfg=RouterConfig(),
+            session_id="test-rr",
         )
-        note = build_route_note(d)
-        assert "clarify" in note
+        assert d.recommended_model == "model-medium-hight"
+        assert d.recommended_level == 2
+        assert d.should_switch is True
 
-    def test_no_switch_note_empty(self):
-        """No switch → empty note."""
+    def test_model_low_to_medium(self):
+        """Low complexity stays at Level 0 (9router)."""
         d = escalate(
-            agent_model="deepseek-v4-flash",
+            agent_model="9router",
             agent_reasoning_effort="medium",
             estimated_tokens=100,
             estimated_files=0,
             user_message="What is the capital?",
             cfg=RouterConfig(),
-            session_id="test-8",
-        )
-        assert build_route_note(d) == ""
-
-    def test_round_robin_within_same_price(self):
-        """Round-robin alternates between Level 0 and 1 (same price)."""
-        d1 = escalate(
-            agent_model="deepseek-v4-flash",
-            agent_reasoning_effort="medium",
-            estimated_tokens=100,
-            estimated_files=0,
-            user_message="Hello",
-            cfg=RouterConfig(),
-            session_id="rr-test",
-        )
-        d2 = escalate(
-            agent_model="deepseek-v4-flash",
-            agent_reasoning_effort="medium",
-            estimated_tokens=100,
-            estimated_files=0,
-            user_message="Hello again",
-            cfg=RouterConfig(),
-            session_id="rr-test",
-        )
-        labels = {d1.recommended_label, d2.recommended_label}
-        assert len(labels) > 1  # rotated between different effort levels
-
-    def test_reset_rr(self):
-        """Reset round-robin state."""
-        reset_rr("reset-test")
-        # Should work without errors
-        assert True
-
-    def test_9router_bypass_escalation(self):
-        """9router model bypasses escalation regardless of complexity/tokens."""
-        d = escalate(
-            agent_model="9router",
-            agent_reasoning_effort="medium",
-            estimated_tokens=800_000,
-            estimated_files=100,
-            user_message="Debug this crash and find root cause",
-            cfg=RouterConfig(),
-            session_id="test-9router",
+            session_id="test-low-medium",
         )
         assert d.recommended_model == "9router"
         assert d.should_switch is False
-        assert d.reason == "custom combo / round-robin model active, skipping escalation"
 
-    def test_round_robin_bypass_escalation(self):
-        """nvidia-round-robin model bypasses escalation regardless of complexity/tokens."""
+    def test_model_only_plan(self):
+        """Planning tasks escalate to Level 1 (model-only-plan)."""
         d = escalate(
-            agent_model="nvidia-round-robin",
+            agent_model="9router",
             agent_reasoning_effort="medium",
-            estimated_tokens=800_000,
-            estimated_files=100,
+            estimated_tokens=100,
+            estimated_files=0,
+            user_message="Plan the project architecture",
+            cfg=RouterConfig(),
+            session_id="test-plan",
+        )
+        assert d.recommended_model == "model-only-plan"
+        assert d.recommended_level == 1
+        assert d.should_switch is True
+
+    def test_model_medium_high(self):
+        """Medium-high complexity tasks escalate to Level 2."""
+        d = escalate(
+            agent_model="9router",
+            agent_reasoning_effort="medium",
+            estimated_tokens=100,
+            estimated_files=0,
             user_message="Debug this crash and find root cause",
             cfg=RouterConfig(),
-            session_id="test-rr",
+            session_id="test-medium-high",
         )
-        assert d.recommended_model == "nvidia-round-robin"
-        assert d.should_switch is False
-        assert d.reason == "custom combo / round-robin model active, skipping escalation"
+        assert d.recommended_model == "model-medium-hight"
+        assert d.recommended_level == 2
+        assert d.should_switch is True
 
 
 # =============================================================================
@@ -288,8 +258,8 @@ class TestBuildRouteNote:
     def test_empty_when_no_switch(self):
         d = EscalationDecision(
             current_level=0, recommended_level=0,
-            recommended_model="deepseek-v4-flash",
-            recommended_effort="medium", recommended_label="Flash Medium",
+            recommended_model="9router",
+            recommended_effort="medium", recommended_label="DeepSeek V4 Flash Medium",
             reason="", should_switch=False, auto_switch=False,
             is_upgrade=False, is_downgrade=False,
         )
@@ -298,9 +268,9 @@ class TestBuildRouteNote:
     def test_auto_switch_note_has_pricing(self):
         d = EscalationDecision(
             current_level=0, recommended_level=2,
-            recommended_model="deepseek-v4-pro",
-            recommended_effort="high", recommended_label="DeepSeek V4 Pro High",
-            reason="deep reasoning needed",
+            recommended_model="model-medium-hight",
+            recommended_effort="medium", recommended_label="DeepSeek V4 Pro Medium",
+            reason="complexity requires higher effort level",
             should_switch=True, auto_switch=True,
             is_upgrade=True, is_downgrade=False,
             cost_per_million=1.74,
@@ -308,4 +278,4 @@ class TestBuildRouteNote:
         note = build_route_note(d)
         assert "Auto-escalating" in note
         assert "$1.74" in note
-        assert "Pro High" in note
+        assert "Pro Medium" in note

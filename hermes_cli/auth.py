@@ -1691,6 +1691,13 @@ def resolve_provider(
     except Exception:
         pass
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
+    if (
+        "9router" in normalized
+        or "round-robin" in normalized
+        or "round_robin" in normalized
+        or normalized.startswith("custom:")
+    ):
+        return "custom"
 
     if normalized == "openrouter":
         return "openrouter"
@@ -1728,8 +1735,21 @@ def resolve_provider(
         _model_cfg = (load_config() or {}).get("model")
         if isinstance(_model_cfg, dict):
             _cfg_provider = _model_cfg.get("provider")
-            if isinstance(_cfg_provider, str) and _cfg_provider.strip().lower() in PROVIDER_REGISTRY:
-                return _cfg_provider.strip().lower()
+            if isinstance(_cfg_provider, str):
+                _cfg_pnorm = _cfg_provider.strip().lower()
+                # Custom / local / round-robin providers are not in PROVIDER_REGISTRY
+                # but are explicitly configured — return early so env-var detection
+                # (e.g. OPENCODE_GO_API_KEY) doesn't hijack the provider choice.
+                if (
+                    _cfg_pnorm.startswith("custom:")
+                    or _cfg_pnorm == "custom"
+                    or "9router" in _cfg_pnorm
+                    or "round-robin" in _cfg_pnorm
+                    or "round_robin" in _cfg_pnorm
+                ):
+                    return "custom"
+                if _cfg_pnorm in PROVIDER_REGISTRY:
+                    return _cfg_pnorm
     except Exception as e:
         logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
 
@@ -6301,6 +6321,15 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     target = (provider_id or get_active_provider() or "").strip().lower()
     if not target:
         return {"logged_in": False}
+    if (
+        "9router" in target
+        or "round-robin" in target
+        or "round_robin" in target
+        or target.startswith("custom:")
+        or target == "custom"
+        or target == "local"
+    ):
+        return {"logged_in": True, "provider": target, "configured": True}
     if target == "spotify":
         return get_spotify_auth_status()
     if target == "nous":

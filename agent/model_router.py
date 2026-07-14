@@ -6,13 +6,13 @@ then escalates step by step when the current level proves insufficient.
 
 Escalation levels (cost-ascending, effort-ascending):
 
-  Level 0: DeepSeek V4 Flash Medium  — $0.14/M, effort=medium
-  Level 1: DeepSeek V4 Flash High    — $0.14/M, effort=high   (same price!)
-  Level 2: DeepSeek V4 Pro High      — $1.74/M, effort=high
-  Level 3: DeepSeek V4 Pro Max       — $1.74/M, effort=max
+  Level 0: DeepSeek V4 Flash Medium  — $0.14/M, effort=low    (simple/low effort)
+  Level 1: Mistral Codestral Latest  — $0.14/M, effort=medium (planning/architecture)
+  Level 2: Mistral Large Latest      — $0.14/M, effort=high   (medium-high complexity)
 
-Why Level 1 costs the same as Level 0: it's the SAME model
-(deepseek-v4-flash) with higher reasoning effort — no extra token cost.
+**Implementation:** All tiers use 9router as the primary model, with 9router handling
+internal round-robin logic across its model pool. The UI displays the original
+model names for clarity, but all requests are routed through 9router.
 
 Config (``config.yaml`` → ``agent.model_router``)
 -------------------------------------------------
@@ -49,10 +49,17 @@ class EscalationLevel:
 
 
 ESCALATION: list[EscalationLevel] = [
-    EscalationLevel("DeepSeek V4 Flash Medium", "deepseek-v4-flash", "medium", 0.14, 0),
-    EscalationLevel("DeepSeek V4 Flash Max",    "deepseek-v4-flash", "max",    0.14, 1),
-    EscalationLevel("DeepSeek V4 Pro Medium",   "deepseek-v4-pro",   "medium", 1.74, 2),
-    EscalationLevel("DeepSeek V4 Pro Max",      "deepseek-v4-pro",   "max",    1.74, 3),
+    # Level 0: model-low-to-medium - Simple/low effort tasks
+    EscalationLevel("DeepSeek V4 Flash Medium", "model-low-to-medium", "medium", 0.14, 0),
+
+    # Level 1: model-only-plan - Planning/architecture tasks
+    EscalationLevel("DeepSeek V4 Flash Max", "model-only-plan", "max", 0.14, 1),
+
+    # Level 2: model-medium-high - Medium-high complexity tasks
+    EscalationLevel("DeepSeek V4 Pro Medium", "model-medium-hight", "medium", 1.74, 2),
+
+    # Level 3: model-high-pressure/very-long-complex
+    EscalationLevel("GLM 5.2", "model-medium-hight", "max", 1.74, 3),
 ]
 
 _LEVEL_BY_MODEL_EFFORT: dict[tuple[str, str], int] = {
@@ -226,30 +233,39 @@ def _analyze_complexity(user_message: str) -> int:
     if "Traceback" in msg or "Error:" in msg or "Exception" in msg:
         score += 2
 
-    # ── Semantic depth ──────────────────────────────────────────
     # Debugging / root cause / troubleshooting — strong signal
     has_debug = any(kw in msg_lower for kw in ("debug", "root cause", "troubleshoot", "diagnose"))
     has_security = any(kw in msg_lower for kw in ("security", "investigate", "vulnerability"))
-    if has_debug:
-        score += 3  # Debugging alone bumps to Level 2
-    if has_security:
-        score += 3  # Security alone bumps to Level 2
     if has_debug and "root cause" in msg_lower:
-        score += 1  # Combo: debug + root cause → Pro Max territory
+        score += 2  # Debug + root cause → Level 2 (DeepSeek V4 Pro)
+    elif has_debug:
+        score += 1  # Debug alone → Level 1 (9router)
+    if has_security:
+        score += 2  # Security bumps to Level 2 (DeepSeek V4 Pro)
+
+    # Critical / crash / leak keywords
+    for kw in ("critical", "crash", "leak", "severe", "urgent", "vulnerability"):
+        if kw in msg_lower:
+            score += 1
+            break
 
     # Architecture / research / analysis — needs analytical effort
     for kw in ("architecture", "proposal", "research", "codebase analysis",
                "analyze project", "repository-wide", "system design",
                "technical proposal"):
         if kw in msg_lower:
-            score += 2
+            score += 1  # Architecture → Level 1 (9router)
             break
+
+    # Planning — specific to 9router tier
+    if "plan" in msg_lower or "planning" in msg_lower:
+        score += 1  # Planning → Level 1 (9router)
 
     # Refactoring / restructuring — moderate complexity
     for kw in ("refactor", "restructure", "migrate code", "extract",
                "split file", "rewrite"):
         if kw in msg_lower:
-            score += 1
+            score += 1  # Refactoring → Level 1 (9router)
             break
 
     # Multiple tasks = higher complexity
@@ -257,16 +273,17 @@ def _analyze_complexity(user_message: str) -> int:
                       msg_lower.count(" - update") + msg_lower.count(" - fix") + \
                       msg_lower.count(" - create")
     if task_indicators >= 3:
-        score += 1
+        score += 1  # Multiple tasks → Level 1 (9router)
 
-    # ── Map score to level ──────────────────────────────────────
+
+    # ── Map score to complexity level ──
     if score >= 8:
-        return 3  # Very complex — Pro Max
+        return 3  # Very complex
     if score >= 3:
-        return 2  # Complex — Pro Medium
-    if score >= 2:
-        return 1  # Moderate — Flash Max
-    return 0  # Simple — Flash Medium
+        return 2  # Complex (debugging, security)
+    if score >= 1:
+        return 1  # Moderate (planning, architecture)
+    return 0  # Simple
 
 
 # ── Escalate ────────────────────────────────────────────────────────────────
@@ -274,47 +291,67 @@ def _analyze_complexity(user_message: str) -> int:
 
 def _current_level(agent_model: str, agent_effort: str) -> int:
     """Map current agent state to an escalation level."""
-    key = (agent_model, agent_effort)
-    return _LEVEL_BY_MODEL_EFFORT.get(key, 0)
+    model_lower = (agent_model or "").lower()
+    effort_lower = (agent_effort or "").lower()
+
+    if "model-medium-hight" in model_lower:
+        if effort_lower == "max":
+            return 3
+        return 2
+    if "model-only-plan" in model_lower:
+        return 1
+    if "model-low-to-medium" in model_lower:
+        return 0
+    if "glm-5.2" in model_lower:
+        return 3
+    if "deepseek-v4-pro" in model_lower:
+        return 2
+    if "deepseek-v4-flash" in model_lower:
+        if effort_lower == "max":
+            return 1
+        return 0
+    if "9router" in model_lower or "round-robin" in model_lower or "round_robin" in model_lower:
+        return 0
+    return 0
 
 
 def _target_level(
     current_level: int,
     estimated_tokens: int,
     estimated_files: int,
-    complexity: int,
+    user_message: str,
     cfg: RouterConfig,
 ) -> int:
-    """Determine the appropriate escalation level based on actual analysis.
-
-    Uses BOTH content analysis (complexity 0-3) and runtime metrics
-    (tokens, files) to decide.
-    """
+    """Determine the appropriate escalation level based on actual analysis."""
     ctx_len = 1_000_000
     pressure = estimated_tokens / ctx_len if ctx_len > 0 else 0
 
-    # ── Highest priority: runtime metrics ──
+    # 1. High context pressure -> Level 3 (GLM-5.2)
     if pressure >= cfg.context_pressure_threshold:
-        return max(current_level, 3)  # Pro Max
+        return 3
 
+    # 2. Large file count -> Level 2 (Pro Medium)
     if estimated_files >= cfg.large_file_count_threshold:
-        return max(current_level, 2)  # Pro Medium
+        return 2
 
-    # ── Content analysis ──
+    msg_lower = (user_message or "").lower()
+    refactoring = any(kw in msg_lower for kw in (
+        "refactor", "restructure", "rewrite", "reorganize",
+        "migrate code", "extract", "split file"
+    ))
+
+    complexity = _analyze_complexity(user_message)
+
     if complexity >= 3:
-        return max(current_level, 3)  # Pro Max
+        return 3
     if complexity >= 2:
-        return max(current_level, 2)  # Pro Medium
+        return 2
+    if refactoring and (estimated_files >= 3 or estimated_tokens >= 30_000):
+        return 1
     if complexity >= 1:
-        return max(current_level, 1)  # Flash Max
+        return 1
 
-    # ── Secondary metrics ──
-    if estimated_files >= 50:
-        return max(current_level, 1)
-    if estimated_tokens >= 100_000:
-        return max(current_level, 1)
-
-    return 0  # Flash Medium
+    return 0
 
 
 # ── Main entry point ────────────────────────────────────────────────────────
@@ -343,102 +380,77 @@ def escalate(
     Returns:
         EscalationDecision with the recommended level and model.
     """
-    # Bypassing escalation for custom 9Router / round-robin combo models
-    model_lower = (agent_model or "").lower()
-    if (
-        "9router" in model_lower
-        or "round-robin" in model_lower
-        or "round_robin" in model_lower
-    ):
+    if not cfg.enabled:
+        current = _current_level(agent_model, agent_reasoning_effort)
         return EscalationDecision(
-            current_level=0,
-            recommended_level=0,
+            current_level=current,
+            recommended_level=current,
             recommended_model=agent_model,
             recommended_effort=agent_reasoning_effort,
             recommended_label=agent_model,
-            reason="custom combo / round-robin model active, skipping escalation",
+            reason="router disabled",
             should_switch=False,
             auto_switch=cfg.auto_switch,
             is_upgrade=False,
             is_downgrade=False,
-            cost_per_million=0.0,
         )
 
-    # Detect current level
     current = _current_level(agent_model, agent_reasoning_effort)
-    complexity = _analyze_complexity(user_message)
+    target = _target_level(current, estimated_tokens, estimated_files, user_message, cfg)
 
-    # Determine target level (complexity + runtime metrics)
-    target = _target_level(current, estimated_tokens, estimated_files, complexity, cfg)
+    # Escalation/downgrade decision
+    chosen = target
 
-    # Round-robin within the same cost bracket (Level 0↔1 both $0.14, Level 2↔3 both $1.74)
-    # Rotate when staying at same level; escalate UP when task demands;
-    # descend DOWN when task becomes simple again (cost optimization).
-    if target > current:
-        chosen = target
-    elif target < current:
-        # Task became simpler — descend DOWN to save cost
-        chosen = target
-    elif target == 0:
-        # Alternate between Flash Medium and Flash High (same price)
-        candidates = [0, 1]
-        if session_id:
-            chosen = _next_rr(f"{session_id}/l0", candidates)
-        else:
-            chosen = candidates[0]
-    elif target == 1:
-        # Even when target is 1, still consider Flash Medium if it was working
-        if current <= 1:
-            candidates = [0, 1] if session_id else [1]
-            chosen = _next_rr(f"{session_id}/l0", candidates) if session_id else 1
-        else:
-            chosen = target
-    elif target == 2 or target == 3:
-        # Pro tier — alternate between High and Max if needed
-        if complexity >= 2 and current < 3 and estimated_tokens >= 700_000:
-            chosen = 3  # Force Pro Max on high pressure + reasoning
-        elif current == 2 and target == 2:
-            candidates = [2, 3] if session_id else [2]
-            chosen = _next_rr(f"{session_id}/l1", candidates) if session_id else 2
-        elif current < 2 and target >= 2:
-            # Escalating up: start at Pro High
-            chosen = 2
-        else:
-            chosen = target
-    else:
-        chosen = target
-
-    level = ESCALATION[chosen]
     should_switch = chosen != current
     is_upgrade = chosen > current
     is_downgrade = chosen < current
 
+    if should_switch:
+        level = ESCALATION[chosen]
+        rec_model = level.model_id
+        rec_effort = level.reasoning_effort
+        rec_label = level.label
+        rec_cost = level.cost
+    else:
+        # Don't switch model name if we stay at the same level
+        rec_model = agent_model
+        rec_effort = agent_reasoning_effort
+        rec_label = agent_model
+        rec_cost = ESCALATION[current].cost
+
     # Build reason
     reasons = []
     if is_upgrade:
+        complexity = _analyze_complexity(user_message)
         if complexity >= 2:
             reasons.append("deep reasoning needed")
         if estimated_tokens >= 500_000:
             reasons.append(f"context pressure ({estimated_tokens:,} tokens)")
         if estimated_files >= cfg.large_file_count_threshold:
             reasons.append(f"{estimated_files} files touched")
-    if is_downgrade:
+        if "plan" in user_message.lower() or "planning" in user_message.lower():
+            reasons.append("planning task")
+        if "architecture" in user_message.lower() or "design" in user_message.lower():
+            reasons.append("architecture task")
+        if not reasons:
+            reasons.append("default level")
+    elif is_downgrade:
         reasons.append("task completed, reducing cost")
-    if not reasons:
+    else:
         reasons.append("default level")
 
     return EscalationDecision(
         current_level=current,
         recommended_level=chosen,
-        recommended_model=level.model_id,
-        recommended_effort=level.reasoning_effort,
-        recommended_label=level.label,
+        recommended_model=rec_model,
+        recommended_effort=rec_effort,
+        recommended_label=rec_label,
         reason=", ".join(reasons),
         should_switch=should_switch,
         auto_switch=cfg.auto_switch,
         is_upgrade=is_upgrade,
         is_downgrade=is_downgrade,
-        cost_per_million=level.cost,
+        cost_per_million=rec_cost,
     )
 
 

@@ -1,18 +1,16 @@
-"""Native CodeAtlas Second Brain MemoryProvider.
+"""Native CodeAtlas Second Brain MemoryProvider — 3-Tier Cache Architecture.
 
-Integrates CodeAtlas as a first-class MemoryProvider registered with
-Hermes's MemoryManager. This is NOT a plugin hook — it's the same
-integration layer as the built-in memory system and Honcho/Mem0.
+Tiers:
+  Tier 1 — In-memory memo cache (TTL 30min, query-keyed)
+  Tier 2 — Local JSON store (~/.hermes/second_brain/*.json)
+  Tier 3 — CodeAtlas Cloud (Oracle 26ai)
 
-Architecture:
-  - prefetch()      → auto-retrieve dreams, genome, immune, skills (no user trigger)
-  - sync_turn()     → auto-save knowledge, evolve genome (no user command)
-  - system_prompt_block() → inject CodeAtlas awareness into system prompt
-  - get_tool_schemas()    → expose query/save tools to the model
-  - queue_prefetch()      → background prefetch for next turn's context
+Flow:
+  prefetch()   → T1(memo) → T2(local) → T3(cloud) → write-through T2
+  sync_turn()  → quality filter → T3(cloud FIRST) → T2(local cache)
+  queue_prefetch() → background warm T1
 
-All retrieval and learning is automatic. The user never needs to say:
-  "Load my memories", "Search Dreams", "Query Genome", "Save this".
+This is a Hermes MemoryProvider registered via config memory.provider: codeatlas.
 """
 
 from __future__ import annotations
@@ -33,9 +31,11 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 API_URL = "http://localhost:8080/"
-UA = "Hermes-CodeAtlas-Provider/1.0"
-TIMEOUT = 4  # seconds for localhost requests
-MAX_CONTEXT_CHARS = 1500  # cap injected context to avoid prompt bloat
+UA = "Hermes-CodeAtlas-Provider/2.0"
+TIMEOUT = 4
+MAX_CONTEXT_CHARS = 2000
+MEMO_TTL = 1800  # 30 min in-memory
+CACHE_TTL = 86400  # 24h local cache expiry
 
 
 def _resolve_api_key() -> str:
@@ -80,204 +80,223 @@ def _api_rq(method: str, path: str, body: dict | None = None,
         return {"err": str(e)[:200]}, 0
 
 
-# ── Local fallback store ──────────────────────────────────────────────────────
 def _local_store_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "second_brain"
 
 
 class CodeAtlasMemoryProvider(MemoryProvider):
-    """Native CodeAtlas Second Brain as a Hermes MemoryProvider.
+    """Native CodeAtlas Second Brain as a Hermes MemoryProvider — 3-tier cache.
 
-    Automatically:
-      - Retrieves relevant dreams, genome DNA, immune genes, and skills
-        before every LLM turn (prefetch).
-      - Saves valuable new knowledge after every turn (sync_turn).
-      - Exposes codeatlas tools (query_dreams, search_genome, etc.) to the model.
-      - Injects system prompt awareness so the model knows CodeAtlas is active.
+    Tier 1: In-memory memo (TTL 30min, keyed by query hash)
+    Tier 2: Local JSON store (~/.hermes/second_brain/*.json)
+    Tier 3: CodeAtlas Cloud (Oracle 26ai)
 
-    No user commands needed. Entirely automatic.
+    Automatically retrieves dreams, genome, immune before LLM turns
+    and saves valuable knowledge after each turn.
     """
 
     def __init__(self) -> None:
         self._api_key: str = ""
         self._enabled: bool = False
         self._session_id: str = ""
-        # Local memo cache: keyed by query hash → (context, expiry)
+        # Tier 1: In-memory memo cache
         self._memo_cache: Dict[str, tuple[str, float]] = {}
-        self._memo_ttl: float = 1800.0  # 30 minutes
-
-    # ── MemoryProvider interface ─────────────────────────────────────────
+        self._memo_ttl: float = MEMO_TTL
+        # Stats
+        self._stats = {"hit_memo": 0, "miss": 0, "hit_cloud": 0, "hit_cache": 0, "saved": 0}
 
     @property
     def name(self) -> str:
         return "codeatlas"
 
     def is_available(self) -> bool:
-        """Available if API key is configured and local store exists."""
         key = _resolve_api_key()
         if key:
             self._api_key = key
             return True
-        # Even without API key, local store works
         store = _local_store_dir()
         return store.exists()
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
-        """Initialize for a session. Called once at agent startup."""
         self._session_id = session_id or ""
         self._api_key = _resolve_api_key()
         self._enabled = bool(self._api_key)
         store = _local_store_dir()
         store.mkdir(parents=True, exist_ok=True)
         log.info(
-            "[CodeAtlas] Initialized — session=%s | API=%s | store=%s",
+            "[CodeAtlas] v2 Initialized — session=%s | cloud=%s | cache=%s",
             self._session_id[:12] if self._session_id else "?",
             "enabled" if self._enabled else "local-only",
             store,
         )
 
     def system_prompt_block(self) -> str:
-        """Inject CodeAtlas Second Brain awareness into the system prompt."""
+        """Inject Second Brain awareness. Tells model not to use SQLite memories."""
         if not self._enabled:
             return ""
         return (
-            "## CodeAtlas Second Brain (Active)\n"
-            "Your CodeAtlas Second Brain is connected and active. Before responding:\n"
-            "- Relevant dreams, genome DNA, immune genes, and skills are automatically "
-            "prefetched and injected into each user message as context.\n"
-            "- You do NOT need to ask the user to 'search memories' or 'load dreams' — "
-            "retrieval is automatic.\n"
-            "- After completing a task, new knowledge is automatically persisted "
-            "(no 'save' command needed).\n"
-            "- You have access to codeatlas tools (query_dream_memories, search_genome, "
-            "scan_immune, save_dream_memory) if deeper retrieval is needed.\n"
+            "## CodeAtlas Second Brain (Active — Primary Memory)\n"
+            "Your CodeAtlas Second Brain is your persistent memory. "
+            "Relevant dreams, genome DNA, immune genes, and skills are "
+            "automatically prefetched and injected before every response.\n"
+            "- You do NOT need to ask 'search memories' or 'load dreams'.\n"
+            "- After completing a task, knowledge is auto-saved.\n"
+            "- Local conversation cache is ephemeral (working memory only).\n"
+            "- Use codeatlas tools for deeper retrieval if needed.\n"
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Auto-retrieve Second Brain context before the LLM call.
+    # ── Tier 1: In-memory memo cache ─────────────────────────────────────
+    def _memo_get(self, key: str) -> str | None:
+        entry = self._memo_cache.get(key)
+        if entry and time.time() < entry[1]:
+            self._stats["hit_memo"] += 1
+            return entry[0]
+        return None
 
-        Returns formatted context string injected into the user message.
-        Called automatically by MemoryManager before every turn.
-        """
+    def _memo_set(self, key: str, value: str) -> None:
+        now = time.time()
+        self._memo_cache[key] = (value, now + self._memo_ttl)
+        # Prune expired
+        self._memo_cache = {k: v for k, v in self._memo_cache.items() if v[1] > now}
+
+    # ── Tier 2: Local JSON cache ─────────────────────────────────────────
+    def _read_cache(self, name: str) -> list[dict]:
+        f = _local_store_dir() / f"{name}.json"
+        if not f.exists():
+            return []
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            return []
+
+    def _write_cache(self, name: str, data: list[dict]) -> None:
+        try:
+            f = _local_store_dir() / f"{name}.json"
+            f.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        except Exception:
+            pass
+
+    # ── Tier 3: Cloud queries (source of truth) ──────────────────────────
+    def _query_dreams(self, query: str, project: str, limit: int = 5) -> tuple[list[dict], bool]:
+        r, s = _api_rq("GET", "/api/dreams/query",
+                       params={"query": query, "project": project, "limit": limit},
+                       api_key=self._api_key)
+        if 200 <= s < 300:
+            mems = r.get("memories", [])
+            if mems:
+                self._write_cache("dreams_cache", mems)
+                return mems, True
+        return [], False
+
+    def _query_genome(self, query: str, project: str) -> tuple[list[dict], bool]:
+        r, s = _api_rq("GET", "/api/genome/search",
+                       params={"query": query, "project": project, "limit": 3},
+                       api_key=self._api_key)
+        if 200 <= s < 300:
+            genes = r.get("genes", [])
+            if genes:
+                self._write_cache("genome_cache", genes)
+                return genes, True
+        return [], False
+
+    def _query_immune(self, problem: str, project: str) -> tuple[str, bool]:
+        r, s = _api_rq("GET", "/api/genome/immune/context",
+                       params={"problem": problem, "project": project},
+                       api_key=self._api_key)
+        if 200 <= s < 300:
+            ctx = r.get("context", "")
+            if ctx and len(ctx) > 50:
+                self._write_cache("immune_cache", [{"context": ctx[:1000]}])
+                return ctx, True
+        return "", False
+
+    # ── Prefetch (called before every LLM turn) ──────────────────────────
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """3-tier cache: memo → cloud (source of truth) → local fallback."""
         if not query:
             return ""
 
+        cache_key = f"pre_{hash(query) % 1000000}"
         project = "hermes-auto"
         parts: list[str] = []
 
-        # ── Memo cache check ──
-        cache_key = f"pre_{hash(query) % 1000000}"
-        if cache_key in self._memo_cache:
-            ctx, expiry = self._memo_cache[cache_key]
-            if time.time() < expiry and ctx:
-                log.debug("[CodeAtlas] Memo cache hit (%d chars)", len(ctx))
-                return ctx
+        # Tier 1: Memo cache hit?
+        memo_hit = self._memo_get(cache_key)
+        if memo_hit:
+            return memo_hit
 
-        # ── Local dreams ──
-        try:
-            store = _local_store_dir()
-            dreams_file = store / "dreams.json"
-            if dreams_file.exists():
-                local_dreams = json.loads(dreams_file.read_text())
-                q_lower = query.lower()
-                scored = []
-                for d in local_dreams[-100:]:  # Last 100 entries
-                    content = d.get("content", "").lower()
-                    score = sum(1 for w in q_lower.split() if w in content)
-                    if score > 0:
-                        scored.append((score, d))
-                scored.sort(key=lambda x: (x[0], x[1].get("_local_ts", 0)), reverse=True)
-                if scored:
-                    lines = ["## 🧠 Cached Second Brain Knowledge"]
-                    for s, d in scored[:5]:
-                        c = d.get("content", "")[:200]
-                        mt = d.get("memory_type", "?")
-                        lines.append(f"- [{mt}] {c}")
+        self._stats["miss"] += 1
+        cloud_hit = False
+
+        # Tier 3: Cloud queries (source of truth)
+        if self._enabled:
+            # Dreams
+            mems, ok = self._query_dreams(query, project)
+            if ok:
+                cloud_hit = True
+                lines = ["## 🧠 CodeAtlas Dreams"]
+                for m in mems[:5]:
+                    c = m.get("content", "")[:300]
+                    lines.append(f"- [{m.get('memory_type', '?')}] {c}")
+                parts.append("\n".join(lines))
+                self._stats["hit_cloud"] += 1
+
+            # Genome DNA
+            genes, ok = self._query_genome(query, project)
+            if ok:
+                cloud_hit = True
+                lines = ["## 🧬 Genome DNA"]
+                for g in genes[:3]:
+                    lines.append(f"- [{g.get('category', '?')}] {g.get('name', '')} "
+                                 f"(confidence: {g.get('confidence', '?')})")
+                parts.append("\n".join(lines))
+
+            # Immune
+            ctx, ok = self._query_immune(query, project)
+            if ok:
+                cloud_hit = True
+                parts.append(f"## 🛡️ Immune Prevention\n{ctx[:500]}")
+
+        # Tier 2: Local cache (fallback when cloud unavailable)
+        if not cloud_hit:
+            self._stats["hit_cache"] += 1
+            for cache_name, label in [
+                ("dreams_cache", "## 🧠 Cached Dreams"),
+                ("genome_cache", "## 🧬 Cached Genome"),
+                ("immune_cache", "## 🛡️ Cached Immune"),
+            ]:
+                cached = self._read_cache(cache_name)
+                if cached:
+                    lines = [label]
+                    for entry in cached[:3]:
+                        c = (entry.get("content") or
+                             entry.get("name") or
+                             entry.get("context") or "")[:200]
+                        if c:
+                            lines.append(f"- {c}")
                     parts.append("\n".join(lines))
-        except Exception as e:
-            log.debug("[CodeAtlas] Local search failed: %s", e)
-
-        # ── Cloud: Dreams ──
-        if self._enabled:
-            try:
-                r, s = _api_rq("GET", "/api/dreams/query",
-                               params={"query": query, "project": project, "limit": 3},
-                               api_key=self._api_key)
-                if 200 <= s < 300:
-                    mems = r.get("memories", [])
-                    if mems:
-                        lines = ["## ☁️ CodeAtlas Dreams"]
-                        for m in mems:
-                            c = m.get("content", "")[:200]
-                            mt = m.get("memory_type", "?")
-                            lines.append(f"- [{mt}] {c}")
-                        parts.append("\n".join(lines))
-            except Exception as e:
-                log.debug("[CodeAtlas] Dream query failed: %s", e)
-
-        # ── Cloud: Genome ──
-        if self._enabled:
-            try:
-                r, s = _api_rq("GET", "/api/genome/search",
-                               params={"query": query, "project": project, "limit": 3},
-                               api_key=self._api_key)
-                if 200 <= s < 300:
-                    genes = r.get("genes", [])
-                    if genes:
-                        lines = ["## 🧬 CodeAtlas Genome DNA"]
-                        for g in genes[:3]:
-                            lines.append(
-                                f"- [{g.get('category', '')}] {g.get('name', '')} "
-                                f"(confidence: {g.get('confidence', '')})"
-                            )
-                        parts.append("\n".join(lines))
-            except Exception as e:
-                log.debug("[CodeAtlas] Genome search failed: %s", e)
-
-        # ── Cloud: Immune ──
-        if self._enabled:
-            try:
-                r, s = _api_rq("GET", "/api/genome/immune/context",
-                               params={"problem": query, "project": project},
-                               api_key=self._api_key)
-                if 200 <= s < 300:
-                    ctx = r.get("context", "")
-                    if ctx and len(ctx) > 50:
-                        parts.append(
-                            f"## 🛡️ Immune Prevention Context\n{ctx[:500]}"
-                        )
-            except Exception as e:
-                log.debug("[CodeAtlas] Immune scan failed: %s", e)
 
         if not parts:
             return ""
 
         combined = "\n\n".join(parts)
-        # Truncate to avoid prompt bloat
         if len(combined) > MAX_CONTEXT_CHARS:
             combined = combined[:MAX_CONTEXT_CHARS] + "\n[...truncated]"
 
-        # Memo cache
-        self._memo_cache[cache_key] = (combined, time.time() + self._memo_ttl)
-        # Prune old entries
-        now = time.time()
-        self._memo_cache = {
-            k: v for k, v in self._memo_cache.items()
-            if v[1] > now
-        }
-
+        # Populate Tier 1
+        self._memo_set(cache_key, combined)
         return combined
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Background prefetch for the next turn."""
+        """Background warm Tier 1 for the next turn."""
         if not query:
             return
-        # Warm the memo cache in background
         try:
             self.prefetch(query, session_id=session_id)
         except Exception:
             pass
 
+    # ── Sync (called after every turn) ───────────────────────────────────
     def sync_turn(
         self,
         user_content: str,
@@ -286,79 +305,71 @@ class CodeAtlasMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Auto-save valuable knowledge after each turn.
-
-        Quality checks:
-          - Response must be substantial (>200 chars)
-          - Must contain knowledge signals (patterns, fixes, lessons)
-          - Not code-heavy (>50% code lines)
-        """
+        """Write-through save: cloud FIRST (source of truth), then local cache."""
         if not assistant_content or len(assistant_content) < 200:
             return
         if not self._quality_filter(user_content, assistant_content):
             return
 
-        project = "hermes-auto"
         summary = assistant_content[:250].replace("\n", " ").strip()
-
         dream = {
             "memory_type": "KNOWLEDGE",
             "content": f"[Auto] Q: {user_content[:100]} | A: {summary[:200]}",
             "importance": 5,
-            "project": project,
+            "project": "hermes-auto",
             "session_id": session_id or self._session_id or f"auto-{int(time.time())}",
         }
 
-        # ── Save locally ──
-        try:
-            store = _local_store_dir()
-            store.mkdir(parents=True, exist_ok=True)
-            dreams_file = store / "dreams.json"
-            existing: list[dict] = []
-            if dreams_file.exists():
-                existing = json.loads(dreams_file.read_text())
-            # Dedup
-            if not self._is_duplicate(dream, existing):
-                dream["_local_ts"] = time.time()
-                existing.append(dream)
-                # Prune: keep last 200, drop >90 days old
-                cutoff = time.time() - 90 * 86400
-                existing = [d for d in existing if d.get("_local_ts", 0) > cutoff]
-                existing = existing[-200:]
-                dreams_file.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
-                log.info("[CodeAtlas] 💾 Auto-saved to local store")
-        except Exception as e:
-            log.warning("[CodeAtlas] Local save failed: %s", e)
-
-        # ── Save to cloud ──
+        # Cloud save FIRST (source of truth)
+        cloud_saved = False
         if self._enabled:
             try:
                 r, s = _api_rq("POST", "/api/dreams/save", body=dream,
                                api_key=self._api_key)
                 if 200 <= s < 300:
-                    log.info("[CodeAtlas] ☁️ Auto-saved to cloud")
+                    cloud_saved = True
+                    log.info("[CodeAtlas] ☁️ Cloud save OK — id=%s", r.get("id", "?"))
             except Exception as e:
-                log.debug("[CodeAtlas] Cloud save skipped: %s", e)
+                log.debug("[CodeAtlas] Cloud save failed: %s", e)
 
+        # Local cache always (offline fallback + dedup)
+        self._save_local_dream(dream)
+        self._stats["saved"] += 1
+
+    def _save_local_dream(self, dream: dict) -> bool:
+        """Save to local JSON cache with dedup and pruning."""
+        try:
+            store = _local_store_dir()
+            store.mkdir(parents=True, exist_ok=True)
+            f = store / "dreams.json"
+            existing: list[dict] = []
+            if f.exists():
+                existing = json.loads(f.read_text())
+            if self._is_duplicate(dream, existing):
+                return False
+            dream["_local_ts"] = time.time()
+            existing.append(dream)
+            # Prune: keep last 200, drop >90 days
+            cutoff = time.time() - 90 * 86400
+            existing = [d for d in existing if d.get("_local_ts", 0) > cutoff]
+            existing = existing[-200:]
+            f.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+            return True
+        except Exception:
+            return False
+
+    # ── Tool schemas ──────────────────────────────────────────────────────
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Expose codeatlas tools to the model.
-
-        These are available as native tools — the model can call them
-        mid-reasoning when deeper retrieval is needed.
-        """
         if not self._enabled:
             return []
         return [
             {
                 "name": "query_dream_memories",
-                "description": (
-                    "Search the CodeAtlas Second Brain dream memory for "
-                    "relevant knowledge, patterns, mistakes, and preferences."
-                ),
+                "description": "Search CodeAtlas Second Brain for relevant knowledge.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Natural language search query"},
+                        "query": {"type": "string", "description": "Search query"},
                         "project": {"type": "string", "description": "Project scope (default: hermes-auto)"},
                         "limit": {"type": "integer", "description": "Max results (1-100, default: 5)"},
                     },
@@ -367,10 +378,7 @@ class CodeAtlasMemoryProvider(MemoryProvider):
             },
             {
                 "name": "search_genome",
-                "description": (
-                    "Search the CodeAtlas Genome for relevant DNA patterns, "
-                    "solutions, and architectural knowledge."
-                ),
+                "description": "Search CodeAtlas Genome for relevant DNA patterns.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -383,14 +391,11 @@ class CodeAtlasMemoryProvider(MemoryProvider):
             },
             {
                 "name": "scan_immune",
-                "description": (
-                    "Scan CodeAtlas Immune System for known issues and "
-                    "preventions matching the current problem."
-                ),
+                "description": "Scan CodeAtlas Immune System for known issues.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "problem": {"type": "string", "description": "Description of the problem"},
+                        "problem": {"type": "string", "description": "Problem description"},
                         "project": {"type": "string", "description": "Project scope"},
                     },
                     "required": ["problem"],
@@ -398,26 +403,13 @@ class CodeAtlasMemoryProvider(MemoryProvider):
             },
             {
                 "name": "save_dream_memory",
-                "description": (
-                    "Persist valuable knowledge to the CodeAtlas Second Brain. "
-                    "Use this for important learnings, patterns discovered, "
-                    "mistakes to avoid, and architectural decisions."
-                ),
+                "description": "Save knowledge to CodeAtlas Second Brain.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "memory_type": {
-                            "type": "string",
-                            "enum": ["KNOWLEDGE", "PATTERN", "MISTAKE", "PREFERENCE", "FEEDBACK"],
-                            "description": "Type of memory",
-                        },
-                        "content": {"type": "string", "description": "The knowledge to persist"},
-                        "importance": {
-                            "type": "integer",
-                            "description": "Importance 1-10 (default: 5)",
-                            "minimum": 1,
-                            "maximum": 10,
-                        },
+                        "memory_type": {"type": "string", "enum": ["KNOWLEDGE", "PATTERN", "MISTAKE", "PREFERENCE", "FEEDBACK"]},
+                        "content": {"type": "string", "description": "Knowledge to persist"},
+                        "importance": {"type": "integer", "description": "1-10 (default: 5)", "minimum": 1, "maximum": 10},
                         "project": {"type": "string", "description": "Project scope"},
                         "session_id": {"type": "string", "description": "Session identifier"},
                     },
@@ -427,35 +419,27 @@ class CodeAtlasMemoryProvider(MemoryProvider):
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs: Any) -> str:
-        """Handle a codeatlas tool call from the model."""
         if not self._enabled:
             return json.dumps({"err": "CodeAtlas not configured"})
-
         project = args.get("project", "hermes-auto")
         try:
             if tool_name == "query_dream_memories":
                 r, s = _api_rq("GET", "/api/dreams/query",
-                               params={"query": args.get("query", ""),
-                                       "project": project,
+                               params={"query": args.get("query", ""), "project": project,
                                        "limit": args.get("limit", 5)},
                                api_key=self._api_key)
                 return json.dumps(r.get("memories", []) if 200 <= s < 300 else {"err": r.get("err", "")})
-
             elif tool_name == "search_genome":
                 r, s = _api_rq("GET", "/api/genome/search",
-                               params={"query": args.get("query", ""),
-                                       "project": project,
+                               params={"query": args.get("query", ""), "project": project,
                                        "limit": args.get("limit", 5)},
                                api_key=self._api_key)
                 return json.dumps(r.get("genes", []) if 200 <= s < 300 else {"err": r.get("err", "")})
-
             elif tool_name == "scan_immune":
                 r, s = _api_rq("GET", "/api/genome/immune",
-                               params={"problem": args.get("problem", ""),
-                                       "project": project},
+                               params={"problem": args.get("problem", ""), "project": project},
                                api_key=self._api_key)
                 return json.dumps(r.get("genes", []) if 200 <= s < 300 else {"err": r.get("err", "")})
-
             elif tool_name == "save_dream_memory":
                 r, s = _api_rq("POST", "/api/dreams/save", body={
                     "memory_type": args.get("memory_type", "KNOWLEDGE"),
@@ -465,51 +449,45 @@ class CodeAtlasMemoryProvider(MemoryProvider):
                     "session_id": args.get("session_id", self._session_id),
                 }, api_key=self._api_key)
                 return json.dumps({"saved": bool(200 <= s < 300), "id": r.get("id", "")})
-
             else:
-                return json.dumps({"err": f"Unknown codeatlas tool: {tool_name}"})
-
+                return json.dumps({"err": f"Unknown tool: {tool_name}"})
         except Exception as e:
             return json.dumps({"err": str(e)})
 
     def shutdown(self) -> None:
-        """Clean shutdown."""
+        log.info("[CodeAtlas] Shutdown — stats: memo_hit=%d miss=%d cloud=%d cache=%d saved=%d",
+                 self._stats["hit_memo"], self._stats["miss"],
+                 self._stats["hit_cloud"], self._stats["hit_cache"],
+                 self._stats["saved"])
         self._memo_cache.clear()
 
     # ── Internals ────────────────────────────────────────────────────────
-
     @staticmethod
     def _quality_filter(user_msg: str, assistant_resp: str) -> bool:
-        """Only persist responses with genuine new knowledge."""
         resp = assistant_resp.strip()
         if len(resp) < 200:
             return False
-        knowledge_signals = [
-            "pattern", "learn", "discover", "fix", "error", "bug", "solution",
-            "architecture", "design", "decision", "implement", "deploy",
-            "config", "remember", "note", "lesson", "convention",
-            "standard", "approach", "workaround", "root cause", "patch", "refactor",
-        ]
-        resp_lower = resp.lower()
-        if sum(1 for s in knowledge_signals if s in resp_lower) < 2:
+        signals = ["pattern", "learn", "discover", "fix", "error", "bug", "solution",
+                    "architecture", "design", "decision", "implement", "deploy",
+                    "config", "remember", "note", "lesson", "convention",
+                    "standard", "approach", "workaround", "root cause", "patch", "refactor"]
+        if sum(1 for s in signals if s in resp.lower()) < 2:
             return False
-        code_lines = sum(
-            1 for line in resp.split("\n")
-            if line.strip().startswith(("```", "import ", "def ", "class ", "const ", "export "))
-        )
+        code_lines = sum(1 for line in resp.split("\n")
+                         if line.strip().startswith(("```", "import ", "def ", "class ", "const ", "export ")))
         if code_lines > len(resp.split("\n")) * 0.5:
             return False
         return True
 
     @staticmethod
     def _is_duplicate(dream: dict, existing: list[dict], threshold: float = 0.7) -> bool:
-        """Check Jaccard word overlap for dedup."""
         content = dream.get("content", "").lower().strip()
         if not content:
             return False
-        words_new = set(content.split())
         for d in existing[-50:]:
-            words_old = set(d.get("content", "").lower().split())
+            existing_content = d.get("content", "").lower().strip()
+            words_new = set(content.split())
+            words_old = set(existing_content.split())
             if not words_new or not words_old:
                 continue
             overlap = len(words_new & words_old) / min(len(words_new), len(words_old))

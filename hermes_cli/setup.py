@@ -2242,6 +2242,15 @@ def _model_section_has_credentials(config: dict) -> bool:
     model_cfg = config.get("model") if isinstance(config, dict) else None
     if isinstance(model_cfg, dict):
         provider_id = (model_cfg.get("provider") or "").strip().lower()
+        if (
+            "9router" in provider_id
+            or "round-robin" in provider_id
+            or "round_robin" in provider_id
+            or provider_id.startswith("custom:")
+            or provider_id == "custom"
+            or provider_id == "local"
+        ):
+            return True
         if provider_id in PROVIDER_REGISTRY:
             if _has_key(PROVIDER_REGISTRY[provider_id]):
                 return True

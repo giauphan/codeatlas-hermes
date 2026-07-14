@@ -16,7 +16,7 @@ class MockAgent:
     """Minimal agent stub that tracks model/effort state."""
 
     def __init__(self) -> None:
-        self.model = "deepseek-v4-flash"
+        self.model = "model-low-to-medium"
         self.provider = "opencode-go"
         self.base_url = "https://api.opencode.ai/v1"
         self.reasoning_effort = "medium"
@@ -55,7 +55,7 @@ def test_e2e_simple_question_stays_on_flash_medium():
     )
 
     assert d.should_switch is False
-    assert agent.model == "deepseek-v4-flash"
+    assert agent.model == "model-low-to-medium"
     assert agent.reasoning_effort == "medium"
     assert len(_switch_log) == 0
 
@@ -83,16 +83,16 @@ def test_e2e_debug_auto_switches_to_pro_medium():
         _fake_switch_model(agent, d.recommended_model, "opencode-go")
         agent.reasoning_effort = d.recommended_effort
 
-    assert agent.model == "deepseek-v4-pro"
+    assert agent.model == "model-medium-hight"
     assert agent.reasoning_effort == "medium"
     assert len(_switch_log) == 1
-    assert _switch_log[0]["model"] == "deepseek-v4-pro"
+    assert _switch_log[0]["model"] == "model-medium-hight"
 
 
 def test_e2e_security_high_pressure_to_pro_max():
     """T3: Security + 950K tokens → auto-switch to Pro Max."""
     agent = MockAgent()
-    agent.model = "deepseek-v4-pro"
+    agent.model = "model-medium-hight"
     agent.reasoning_effort = "medium"
     _switch_log.clear()
 
@@ -114,14 +114,14 @@ def test_e2e_security_high_pressure_to_pro_max():
         _fake_switch_model(agent, d.recommended_model, "opencode-go")
         agent.reasoning_effort = d.recommended_effort
 
-    assert agent.model == "deepseek-v4-pro"
+    assert agent.model == "model-medium-hight"
     assert agent.reasoning_effort == "max"
 
 
 def test_e2e_simple_after_complex_auto_descends():
     """T4: After complex task, simple question → auto-descend to Flash Medium."""
     agent = MockAgent()
-    agent.model = "deepseek-v4-pro"
+    agent.model = "model-medium-hight"
     agent.reasoning_effort = "max"
     _switch_log.clear()
 
@@ -143,7 +143,7 @@ def test_e2e_simple_after_complex_auto_descends():
         _fake_switch_model(agent, d.recommended_model, "opencode-go")
         agent.reasoning_effort = d.recommended_effort
 
-    assert agent.model == "deepseek-v4-flash"
+    assert agent.model == "model-low-to-medium"
     assert agent.reasoning_effort == "medium"
 
 
@@ -172,7 +172,7 @@ def test_e2e_medium_refactor_to_flash_max():
         agent.reasoning_effort = d.recommended_effort
 
     # Same model, higher effort
-    assert agent.model == "deepseek-v4-flash"
+    assert agent.model == "model-only-plan"
     assert agent.reasoning_effort == "max"
 
 
@@ -194,5 +194,5 @@ def test_e2e_auto_switch_does_not_downgrade_with_clarify():
     assert d.should_switch is True
     assert d.auto_switch is False  # clarify mode
     # Agent state should NOT change yet
-    assert agent.model == "deepseek-v4-flash"
+    assert agent.model == "model-low-to-medium"
     assert len(_switch_log) == 0  # No switch_model call
